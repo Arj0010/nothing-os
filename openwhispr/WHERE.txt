@@ -1,0 +1,1 @@
+note: OpenWhispr installer kept at ~/Downloads/OpenWhispr-1.7.5.deb

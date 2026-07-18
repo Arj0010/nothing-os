@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Nothing OS Conky
+Comment=Nothing-themed Conky widgets + animated background
+Exec=/home/arjun/.config/conky/nothing/start.sh
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=6
+NoDisplay=true

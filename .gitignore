@@ -1,0 +1,10 @@
+# runtime / personal state — never backed up
+__pycache__/
+*.pyc
+nothing-widgets/positions.json
+nothing-widgets/notes.txt
+
+# proprietary fonts — not redistributable in a public repo (obtain separately)
+fonts/Ndot*.otf
+fonts/NType82*.otf
+fonts/LetteraMonoLL*.otf

@@ -1,0 +1,26 @@
+#!/bin/bash
+# Screenshot -> save to ~/Pictures/Screenshots AND copy PNG to clipboard.
+# Usage: shot [area|full|win]   (default: area — drag to select a region)
+set -euo pipefail
+
+MODE="${1:-area}"
+DIR="$HOME/Pictures/Screenshots"
+mkdir -p "$DIR"
+FILE="$DIR/shot-$(date +%Y%m%d-%H%M%S).png"
+
+case "$MODE" in
+  full) gnome-screenshot -f "$FILE" ;;
+  win)  gnome-screenshot -w -f "$FILE" ;;
+  *)    gnome-screenshot -a -f "$FILE" ;;   # area (drag-select)
+esac
+
+# If the grab was cancelled, no file is written — bail quietly.
+[ -s "$FILE" ] || { rm -f "$FILE" 2>/dev/null || true; exit 0; }
+
+# Copy the PNG onto the clipboard so it can be pasted straight away.
+xclip -selection clipboard -t image/png -i "$FILE"
+
+command -v notify-send >/dev/null 2>&1 && \
+  notify-send -i "$FILE" "Screenshot copied" "$(basename "$FILE") · on clipboard" || true
+
+echo "$FILE"
