@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Nothing OS — interactive, movable desktop widgets (GTK3).
 Drag a widget by its body to move it (position persists); buttons stay clickable."""
-import gi, os, json, subprocess, math, time, random, urllib.request, glob
+import gi, os, json, subprocess, math, time, random, urllib.request, glob, threading
 from collections import deque
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib, Pango  # noqa
@@ -132,6 +132,18 @@ CSS = ("""
 .clock2   { color:#f2f2f2; font-family:"Ndot 57"; font-size:60px; }
 .notes, .notes text { background-color:transparent; color:#d8d8d8;
             font-family:"Lettera Mono LL"; font-size:14px; caret-color:%(a)s; }
+.chat, .chat text { background-color:transparent; color:#d0d0d0;
+            font-family:"Lettera Mono LL"; font-size:13px; }
+.chatin, .chatin text { background-color:#0a0a0a; color:#ededed; caret-color:%(a)s;
+            font-family:"Lettera Mono LL"; font-size:13px; border:1px solid rgba(255,255,255,0.12);
+            border-radius:6px; padding:7px 10px; }
+.chatin:focus { border-color:%(a)s; }
+.sendbtn { background-color:#160607; border:1px solid %(a)s; border-radius:6px;
+            color:#f2f2f2; font-family:"NType 82"; font-size:12px; letter-spacing:2px; padding:7px 16px; }
+.sendbtn:hover { background-color:%(a)s; }
+.chatq { color:%(a)s; font-family:"NType 82"; font-size:11px; letter-spacing:1px; }
+.chata { color:#cfcfcf; font-family:"Lettera Mono LL"; font-size:13px; }
+.chatsys { color:#6a6a6a; font-family:"Lettera Mono LL"; font-size:11px; }
 .media  { background-color:transparent; border:0; color:#9a9a9a;
           font-family:"DejaVu Sans Mono"; font-size:20px; padding:2px 12px; }
 .media:hover { color:%(a)s; }
@@ -824,8 +836,11 @@ class Notes(Widget):
         tv = Gtk.TextView.new_with_buffer(self.buf)
         tv.get_style_context().add_class("notes")
         tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        tv.set_size_request(-1, 108)
-        b.pack_start(tv, True, True, 0)
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)  # vertical scroll
+        sc.set_size_request(-1, 108); sc.get_style_context().add_class("notes")
+        sc.add(tv)
+        b.pack_start(sc, True, True, 0)
         self.add(b)
         self.buf.connect("changed", self._save)
     def _save(self, *_):
@@ -833,17 +848,184 @@ class Notes(Widget):
         try: open(self.FILE, "w").write(self.buf.get_text(s, e, True))
         except Exception: pass
 
+# ---------- AI ASSISTANT (local Ollama, streaming) ----------
+class Assistant(Widget):
+    HOST = "http://127.0.0.1:11434"
+    # fast + capable general model; system facts are injected so it "knows" this machine.
+    MODELS = ["qwen2.5-coder:3b", "qwen2.5-coder:1.5b", "qwen3:4b", "jarvis-coder:latest"]
+    SYS = ("You are Jarvis, a concise assistant living on Arjun's Linux Mint desktop. "
+           "Answer briefly and practically — short paragraphs, code blocks when useful. "
+           "A LIVE SYSTEM snapshot of this exact computer is provided below; when asked "
+           "about the machine (battery, cpu, ram, disk, network, time, uptime), answer "
+           "from it directly and confidently. Don't say you lack access — you have the snapshot.")
+
+    def __init__(self):
+        super().__init__("assistant", 690, 300, 440, focusable=True)
+        self.busy = False; self.history = []; self.model = self.MODELS[0]
+        b = vbox(8, m=18)
+        head = Gtk.Box(spacing=6)
+        self.titlelbl = L("JARVIS", "title"); self.titlelbl.set_hexpand(True); self.titlelbl.set_xalign(0)
+        self.mbtn = Gtk.Button(label="qwen2.5-coder:3b"); self.mbtn.get_style_context().add_class("chatq")
+        self.mbtn.set_relief(Gtk.ReliefStyle.NONE); self.mbtn.connect("clicked", self._cycle_model)
+        clr = Gtk.Button(label="CLEAR"); clr.get_style_context().add_class("media")
+        clr.set_relief(Gtk.ReliefStyle.NONE); clr.connect("clicked", self._clear)
+        dot = L("●", "hdot"); HDOTS.append(dot)
+        head.pack_start(self.titlelbl, True, True, 0)
+        head.pack_end(dot, False, False, 0); head.pack_end(clr, False, False, 0)
+        head.pack_end(self.mbtn, False, False, 0)
+        b.pack_start(head, False, False, 0)
+        # compact live model-status line (folded in from the old Local Model card)
+        self.status = L("— checking model —", "chatsys"); self.status.set_xalign(0)
+        b.pack_start(self.status, False, False, 0)
+        b.pack_start(rule(), False, False, 0)
+        self.first(self._poll_status); GLib.timeout_add(3000, self._poll_status)
+        # transcript
+        self.buf = Gtk.TextBuffer()
+        self.tag_q  = self.buf.create_tag("q", foreground=ACCENT, weight=700)
+        self.tag_a  = self.buf.create_tag("a", foreground="#cfcfcf")
+        self.tag_sys= self.buf.create_tag("sys", foreground="#6a6a6a", style=1)
+        self.tv = Gtk.TextView.new_with_buffer(self.buf)
+        self.tv.get_style_context().add_class("chat")
+        self.tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR); self.tv.set_editable(False)
+        self.tv.set_cursor_visible(False)
+        self.sc = Gtk.ScrolledWindow(); self.sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.sc.set_size_request(-1, 150); self.sc.add(self.tv)
+        b.pack_start(self.sc, True, True, 0)
+        self._append("sys", "Ask me anything — runs on your local model, fully offline.\n")
+        # input row
+        row = Gtk.Box(spacing=8)
+        self.entry = Gtk.Entry(); self.entry.get_style_context().add_class("chatin")
+        self.entry.set_placeholder_text("Message Jarvis…"); self.entry.set_hexpand(True)
+        self.entry.connect("activate", self._send)
+        send = Gtk.Button(label="SEND"); send.get_style_context().add_class("sendbtn")
+        send.set_relief(Gtk.ReliefStyle.NONE); send.connect("clicked", self._send)
+        row.pack_start(self.entry, True, True, 0); row.pack_end(send, False, False, 0)
+        b.pack_start(row, False, False, 0)
+        self.add(b)
+
+    def _append(self, tag, text):
+        end = self.buf.get_end_iter()
+        self.buf.insert_with_tags(end, text, {"q": self.tag_q, "a": self.tag_a, "sys": self.tag_sys}[tag])
+        GLib.idle_add(self._scroll_bottom)
+
+    def _scroll_bottom(self):
+        adj = self.sc.get_vadjustment()
+        if adj: adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
+
+    def _clear(self, *_):
+        self.buf.set_text(""); self.history = []
+        self._append("sys", "Cleared.\n")
+
+    def _send(self, *_):
+        if self.busy: return
+        q = self.entry.get_text().strip()
+        if not q: return
+        self.entry.set_text(""); self.busy = True
+        self._append("q", "\n› " + q + "\n"); self._append("a", "")
+        threading.Thread(target=self._run, args=(q,), daemon=True).start()
+
+    def _run(self, q):
+        # build a chat-style prompt: persona + live system snapshot + short history
+        msgs = [{"role": "system", "content": self.SYS + "\n\n" + self._system_context()}]
+        for u, a in self.history[-4:]:
+            msgs.append({"role": "user", "content": u}); msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content": q})
+        payload = json.dumps({"model": self.model, "messages": msgs, "stream": True,
+                              "think": False}).encode()
+        req = urllib.request.Request(self.HOST + "/api/chat", data=payload,
+                                     headers={"Content-Type": "application/json"})
+        acc = []
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                for line in r:
+                    line = line.strip()
+                    if not line: continue
+                    try: obj = json.loads(line)
+                    except Exception: continue
+                    chunk = (obj.get("message") or {}).get("content", "")
+                    if chunk:
+                        acc.append(chunk)
+                        GLib.idle_add(self._append, "a", chunk)
+                    if obj.get("done"): break
+        except Exception as e:
+            GLib.idle_add(self._append, "sys", "\n[offline or model busy: %s]\n" % str(e)[:60])
+        ans = "".join(acc).strip()
+        if ans: self.history.append((q, ans))
+        GLib.idle_add(self._append, "a", "\n")
+        GLib.idle_add(self._done)
+
+    def _done(self):
+        self.busy = False; return False
+
+    def _poll_status(self):
+        try:
+            with urllib.request.urlopen(self.HOST + "/api/ps", timeout=1.5) as r:
+                models = (json.load(r) or {}).get("models") or []
+        except Exception:
+            self.status.set_text("⚠ ollama offline"); return True
+        if models:
+            m = models[0]; det = m.get("details", {}) or {}
+            size = m.get("size", 0); vram = m.get("size_vram", 0)
+            proc = "GPU" if (size and vram and vram >= size) else ("GPU/CPU" if vram else "CPU")
+            self.status.set_text("● %s · %s · %s · %.1fG"
+                % (m.get("name", "?"), det.get("parameter_size", "?"), proc, size / 1073741824))
+        else:
+            self.status.set_text("○ idle · model unloaded")
+        return True
+
+    def _cycle_model(self, *_):
+        i = (self.MODELS.index(self.model) + 1) % len(self.MODELS)
+        self.model = self.MODELS[i]; self.mbtn.set_label(self.model)
+        self._append("sys", "\n[model → %s]\n" % self.model)
+
+    def _system_context(self):
+        # live snapshot of THIS machine, injected so the model can answer factually
+        def rd(p, d=""):
+            try: return open(p).read().strip()
+            except Exception: return d
+        # cpu %
+        try:
+            v1 = list(map(int, open("/proc/stat").readline().split()[1:]))
+            time.sleep(0.05)
+            v2 = list(map(int, open("/proc/stat").readline().split()[1:]))
+            dt = sum(v2) - sum(v1); di = (v2[3] + v2[4]) - (v1[3] + v1[4])
+            cpu = int((1 - di / dt) * 100) if dt > 0 else 0
+        except Exception: cpu = 0
+        mi = {}
+        for ln in open("/proc/meminfo"):
+            k, _, r = ln.partition(":");
+            if r: mi[k] = int(r.split()[0])
+        ram_used = (mi.get("MemTotal", 0) - mi.get("MemAvailable", 0)) // 1024
+        ram_tot = mi.get("MemTotal", 0) // 1024
+        bat = rd("/sys/class/power_supply/BAT0/capacity", "?")
+        chg = "charging" if any(rd(p) == "1" for p in glob.glob("/sys/class/power_supply/A*/online")) else "on battery"
+        temp = max([int(rd(p, "0")) for p in glob.glob("/sys/class/thermal/thermal_zone*/temp")] or [0]) // 1000
+        up = out("uptime -p | sed 's/^up //'") or "?"
+        load = rd("/proc/loadavg", "?").split(" ")[0]
+        disk = out("df -h / | awk 'NR==2{print $4\" free of \"$2}'")
+        ssid = out("iwgetid -r 2>/dev/null || /usr/sbin/iwgetid -r 2>/dev/null") or "not connected"
+        ip = out("hostname -I 2>/dev/null | awk '{print $1}'") or "?"
+        host = rd("/proc/sys/kernel/hostname", "?")
+        distro = out(". /etc/os-release 2>/dev/null; echo $PRETTY_NAME") or "Linux"
+        now = time.strftime("%A %d %B %Y, %H:%M")
+        return ("LIVE SYSTEM SNAPSHOT (this computer, right now):\n"
+                "- Host: %s · %s (Cinnamon/X11)\n- CPU: Intel i5-1135G7, load now ~%d%%, 1min load %s, temp %d°C\n"
+                "- RAM: %d MB used of %d MB\n- Battery: %s%% (%s)\n- Disk /: %s\n"
+                "- Uptime: %s\n- Network: Wi-Fi '%s', local IP %s\n- Date/time: %s"
+                % (host, distro, cpu, load, temp, ram_used, ram_tot, bat, chg, disk, up, ssid, ip, now))
+
 # ---------- ARCADE (switchable mini-games) ----------
 class Arcade(Widget):
     GAMES = ["DASH", "SNAKE", "REFLEX", "RAIN"]
     HINTS = {"DASH":"space / click to jump", "SNAKE":"click, then arrows / WASD",
              "REFLEX":"click when it turns red", "RAIN":"ambient · dot rain"}
-    W, H = 404, 300
-    COLS, ROWS, CELL = 25, 18, 16
+    W, H = 404, 236
+    COLS, ROWS, CELL = 25, 14, 16
     R = (0.843, 0.098, 0.129)   # accent
 
     def __init__(self):
-        super().__init__("arcade", 690, 540, 440, focusable=True)
+        super().__init__("arcade", 690, 610, 440, focusable=True)
         self.gi = 0; self.frame = 0
         b = vbox(8, m=18)
         head = Gtk.Box(spacing=6)
@@ -1027,7 +1209,8 @@ class Arcade(Widget):
 def main():
     apply_css()
     widgets = [Clock(), Controls(), System(), Network(), NowPlaying(),
-               Status(), Calendar(), Pomodoro(), LLMStatus(), Notes(), Arcade(), Launcher()]
+               Status(), Calendar(), Pomodoro(), Notes(), Arcade(),
+               Assistant(), Launcher()]
     for w in widgets: w.show_all()
     start_pulse()
     Gtk.main()
