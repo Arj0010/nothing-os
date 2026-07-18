@@ -603,7 +603,7 @@ class Launcher(Widget):
             if w in used: continue
             inst, cls = wc.split(".")[0], wc.split(".")[-1]
             self.row.pack_start(self._item([inst, inst.lower(), cls.lower(), cls],
-                                           None, None, None, w),
+                                           (cls or inst)[:14], None, None, w),
                                 False, False, 0)
         self.row.show_all()
         GLib.idle_add(self._recenter)     # keep the pill centred as it grows/shrinks
@@ -634,12 +634,29 @@ class Launcher(Widget):
         btn.connect("enter-notify-event", self._hover, True)
         btn.connect("leave-notify-event", self._hover, False)
         btn.connect("clicked", self._activate, wid, cmd)
+        btn.connect("button-press-event", self._menu, wid, cmd, label)
         self._items.append(btn)
         return btn
 
     def _activate(self, btn, wid, cmd):
         if wid: sh("wmctrl -i -a %s" % wid)   # focus/raise the open window
         elif cmd: sh(cmd)                     # launch a pinned app that isn't running
+
+    def _menu(self, btn, e, wid, cmd, name):
+        # right-click → taskbar-style context menu
+        if e.button != 3: return False
+        m = Gtk.Menu()
+        hdr = Gtk.MenuItem(label=name or "App"); hdr.set_sensitive(False)
+        m.append(hdr); m.append(Gtk.SeparatorMenuItem())
+        def item(text, fn):
+            mi = Gtk.MenuItem(label=text); mi.connect("activate", lambda *_: fn()); m.append(mi)
+        if wid:
+            item("Focus",  lambda: sh("wmctrl -i -a %s" % wid))
+            item("Close",  lambda: sh("wmctrl -ic %s" % wid))   # graceful _NET_CLOSE_WINDOW
+        if cmd:
+            item("Open new window" if wid else "Open", lambda: sh(cmd))
+        m.show_all(); m.popup_at_pointer(e)
+        return True
 
     def _hover(self, btn, e, enter):
         btn._target = self.MAG if enter else self.BASE
