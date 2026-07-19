@@ -1017,16 +1017,21 @@ class Assistant(Widget):
 
 # ---------- ARCADE (switchable mini-games) ----------
 class Arcade(Widget):
-    GAMES = ["DASH", "SNAKE", "REFLEX", "RAIN"]
-    HINTS = {"DASH":"space / click to jump", "SNAKE":"click, then arrows / WASD",
+    GAMES = ["DASH", "HOOPS", "SNAKE", "REFLEX", "RAIN"]
+    HINTS = {"DASH":"space / click to jump (double-jump!)", "HOOPS":"drag from the ball → release to shoot",
+             "SNAKE":"click, then arrows / WASD",
              "REFLEX":"click when it turns red", "RAIN":"ambient · dot rain"}
+    HOOPS_K = 9.0              # drag → launch-velocity gain
+    HOOPS_G = 1300.0           # gravity px/s²
     W, H = 404, 236
     COLS, ROWS, CELL = 25, 14, 16
     R = (0.843, 0.098, 0.129)   # accent
+    SNAKE_STEP = 0.11           # seconds per snake cell (frame-rate independent)
+    FPS_MS = 22                 # ~45 fps timer; physics is dt-scaled so speed is constant
 
     def __init__(self):
         super().__init__("arcade", 690, 610, 440, focusable=True)
-        self.gi = 0; self.frame = 0
+        self.gi = 0; self._last_t = time.monotonic(); self.sn_acc = 0.0
         b = vbox(8, m=18)
         head = Gtk.Box(spacing=6)
         self.titlelbl = L("ARCADE · DASH", "title"); self.titlelbl.set_hexpand(True); self.titlelbl.set_xalign(0)
@@ -1039,40 +1044,60 @@ class Arcade(Widget):
         head.pack_end(dot, False, False, 0); head.pack_end(nxt, False, False, 0); head.pack_end(prev, False, False, 0)
         b.pack_start(head, False, False, 0)
         self.da = Gtk.DrawingArea(); self.da.set_size_request(self.W, self.H); self.da.set_can_focus(True)
-        self.da.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.KEY_PRESS_MASK)
+        self.da.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.KEY_PRESS_MASK
+                           | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.BUTTON1_MOTION_MASK)
         self.da.connect("draw", self._draw)
         self.da.connect("button-press-event", self._click)
+        self.da.connect("button-release-event", self._da_release)
+        self.da.connect("motion-notify-event", self._da_motion)
         self.da.connect("key-press-event", self._key)
         b.pack_start(self.da, False, False, 0)
         self.hint = L(self.HINTS["DASH"], "faint"); self.hint.set_xalign(0)
         b.pack_start(self.hint, False, False, 0)
         self.add(b)
         for n in self.GAMES: self._reset_game(n)
-        GLib.timeout_add(33, self._loop)
+        GLib.timeout_add(self.FPS_MS, self._loop)
 
     def switch(self, d):
         self.gi = (self.gi + d) % len(self.GAMES)
         name = self.GAMES[self.gi]
         self.titlelbl.set_text("ARCADE · " + name); self.hint.set_text(self.HINTS[name])
-        self._reset_game(name); self.da.grab_focus(); self.da.queue_draw()
+        self._reset_game(name); self._last_t = time.monotonic()
+        self.da.grab_focus(); self.da.queue_draw()
 
     def _reset_game(self, name):
         if name == "DASH":
-            self.dash = dict(py=self.H - 24, vy=0, onground=True, obs=[], spd=3.4, dist=0, alive=True, spawn=60)
+            # per-second units: spd px/s, gravity px/s², jump px/s, gap px until next obstacle
+            self.dash = dict(py=self.H - 24, vy=0, onground=True, obs=[],
+                             spd=165.0, dist=0.0, alive=True, gap=140.0, jumps=0)
         elif name == "SNAKE":
             self.sn = dict(body=[(5, 8), (4, 8), (3, 8)], dir=(1, 0), ndir=(1, 0), alive=True, food=(12, 8), score=0)
-            self._snake_food()
+            self.sn_acc = 0.0; self._snake_food()
         elif name == "REFLEX":
             self.rf = dict(state="idle", t0=0.0, best=None, last=None, timer=None)
         elif name == "RAIN":
-            self.rain = [random.uniform(-self.H, 0) for _ in range(self.W // 12)]
+            # each drop: [y, speed px/s]
+            self.rain = [[random.uniform(-self.H, 0), 120 + (i % 3) * 55] for i in range(self.W // 12)]
+        elif name == "HOOPS":
+            self.hoops = dict(bx=80.0, by=150.0, vx=0.0, vy=0.0, r=11,
+                              aiming=False, ax=0.0, ay=0.0, flying=False, scored=False,
+                              score=0, streak=0, hx=self.W - 68.0, hy=74.0, hw=44)
 
     # ---- input ----
     def _click(self, da, e):
         da.grab_focus(); name = self.GAMES[self.gi]
         if name == "DASH": self._dash_jump()
         elif name == "REFLEX": self._reflex_click()
+        elif name == "HOOPS": self._hoops_press(e)
         return True
+
+    def _da_motion(self, da, e):
+        if self.GAMES[self.gi] == "HOOPS": self._hoops_motion(e)
+        return False
+
+    def _da_release(self, da, e):
+        if self.GAMES[self.gi] == "HOOPS": self._hoops_release(e); return True
+        return False
 
     def _key(self, da, e):
         name = self.GAMES[self.gi]; k = e.keyval
@@ -1088,28 +1113,47 @@ class Arcade(Widget):
         return False
 
     def _loop(self):
+        now = time.monotonic()
+        dt = now - self._last_t; self._last_t = now
+        if dt > 0.1: dt = 0.1          # clamp after stalls so nothing teleports
         try:
-            self.frame += 1; name = self.GAMES[self.gi]
-            if name == "DASH" and self.dash["alive"]: self._dash_tick()
-            elif name == "SNAKE" and self.frame % 4 == 0 and self.sn["alive"]: self._snake_tick()
-            elif name == "RAIN": self._rain_tick()
-            self.da.queue_draw()
+            name = self.GAMES[self.gi]; draw = False
+            if name == "DASH":
+                if self.dash["alive"]: self._dash_tick(dt); draw = True
+            elif name == "SNAKE":
+                if self.sn["alive"]:
+                    self.sn_acc += dt
+                    while self.sn_acc >= self.SNAKE_STEP and self.sn["alive"]:
+                        self.sn_acc -= self.SNAKE_STEP; self._snake_tick()
+                    draw = True
+            elif name == "RAIN":
+                self._rain_tick(dt); draw = True
+            elif name == "HOOPS":
+                if self.hoops["flying"]: self._hoops_tick(dt); draw = True
+            # REFLEX is static → it redraws only on state change, not every frame
+            if draw: self.da.queue_draw()
         except Exception: pass
         return True
 
     # ---- DASH ----
     def _dash_jump(self):
         d = self.dash
-        if not d["alive"]: self._reset_game("DASH"); return
-        if d["onground"]: d["vy"] = -8.6; d["onground"] = False
-    def _dash_tick(self):
+        if not d["alive"]:
+            self._reset_game("DASH"); self._last_t = time.monotonic(); self.da.queue_draw(); return
+        if d["jumps"] < 2:            # ground jump + one air (double) jump
+            d["vy"] = -560.0; d["onground"] = False; d["jumps"] += 1
+    def _dash_tick(self, dt):
         d = self.dash; g = self.H - 24
-        d["dist"] += d["spd"]; d["spd"] += 0.0018
-        d["vy"] += 0.5; d["py"] += d["vy"]
-        if d["py"] >= g: d["py"] = g; d["vy"] = 0; d["onground"] = True
-        d["spawn"] -= d["spd"]
-        if d["spawn"] <= 0: d["obs"].append([self.W + 10, 14 + random.random() * 20]); d["spawn"] = 90 + random.random() * 80
-        for o in d["obs"]: o[0] -= d["spd"]
+        d["spd"] += 7.0 * dt                       # gradual speed ramp
+        d["dist"] += d["spd"] * dt
+        d["vy"] += 1600.0 * dt                      # gravity
+        d["py"] += d["vy"] * dt
+        if d["py"] >= g: d["py"] = g; d["vy"] = 0; d["onground"] = True; d["jumps"] = 0
+        d["gap"] -= d["spd"] * dt
+        if d["gap"] <= 0:
+            d["obs"].append([self.W + 10, 14 + random.random() * 20])
+            d["gap"] = 150 + random.random() * 170
+        for o in d["obs"]: o[0] -= d["spd"] * dt
         d["obs"] = [o for o in d["obs"] if o[0] > -20]
         for o in d["obs"]:
             if o[0] < 32 and o[0] + 10 > 18 and d["py"] > g - o[1]: d["alive"] = False
@@ -1136,7 +1180,9 @@ class Arcade(Widget):
         s = self.sn; s["dir"] = s["ndir"]; hx, hy = s["body"][0]
         nx, ny = hx + s["dir"][0], hy + s["dir"][1]
         if nx < 0 or ny < 0 or nx >= self.COLS or ny >= self.ROWS or (nx, ny) in s["body"]:
-            s["alive"] = False; GLib.timeout_add(700, lambda: (self._reset_game("SNAKE"), False)[1]); return
+            s["alive"] = False
+            def _revive(): self._reset_game("SNAKE"); self.da.queue_draw(); return False
+            GLib.timeout_add(700, _revive); return
         s["body"].insert(0, (nx, ny))
         if (nx, ny) == s["food"]: s["score"] += 1; self._snake_food()
         else: s["body"].pop()
@@ -1160,7 +1206,9 @@ class Arcade(Widget):
         r = self.rf; st = r["state"]
         if st in ("idle", "result", "soon"):
             r["state"] = "wait"
-            def go(): r["state"] = "go"; r["t0"] = time.time(); r["timer"] = None; return False
+            def go():
+                r["state"] = "go"; r["t0"] = time.time(); r["timer"] = None
+                self.da.queue_draw(); return False
             r["timer"] = GLib.timeout_add(int(900 + random.random() * 2300), go)
         elif st == "wait":
             if r["timer"]: GLib.source_remove(r["timer"]); r["timer"] = None
@@ -1169,6 +1217,7 @@ class Arcade(Widget):
             r["last"] = int((time.time() - r["t0"]) * 1000)
             if r["best"] is None or r["last"] < r["best"]: r["best"] = r["last"]
             r["state"] = "result"
+        self.da.queue_draw()   # loop doesn't redraw REFLEX, so refresh on each click
     def _draw_reflex(self, cr):
         r = self.rf; st = r["state"]
         bg, msg, col = (0.03,0.03,0.035), "CLICK TO START", (0.55,0.55,0.6)
@@ -1181,16 +1230,81 @@ class Arcade(Widget):
         if r["best"] is not None: self._text(cr, "best %d ms" % r["best"], self.W / 2, self.H - 18, 12, (0.5,0.5,0.55), 0.5)
 
     # ---- RAIN ----
-    def _rain_tick(self):
-        for i in range(len(self.rain)):
-            self.rain[i] += 2.4 + (i % 3)
-            if self.rain[i] > self.H + 20: self.rain[i] = random.uniform(-40, 0)
+    def _rain_tick(self, dt):
+        for r in self.rain:
+            r[0] += r[1] * dt                          # y += speed·dt
+            if r[0] > self.H + 20: r[0] = random.uniform(-40, 0)
     def _draw_rain(self, cr):
-        for i, y in enumerate(self.rain):
-            cx = i * 12 + 6
+        for i, r in enumerate(self.rain):
+            cx = i * 12 + 6; y = r[0]
             cr.set_source_rgba(*self.R, 1); cr.arc(cx, y, 2, 0, 6.2832); cr.fill()
             cr.set_source_rgba(0.9, 0.9, 0.9, 0.5); cr.arc(cx, y - 10, 1.4, 0, 6.2832); cr.fill()
             cr.set_source_rgba(0.9, 0.9, 0.9, 0.16); cr.arc(cx, y - 20, 1.1, 0, 6.2832); cr.fill()
+
+    # ---- HOOPS (slingshot basketball) ----
+    def _hoops_press(self, e):
+        h = self.hoops
+        if h["flying"]: return
+        if math.hypot(e.x - h["bx"], e.y - h["by"]) < 48:
+            h["aiming"] = True; h["ax"] = e.x; h["ay"] = e.y; self.da.queue_draw()
+    def _hoops_motion(self, e):
+        h = self.hoops
+        if h["aiming"]: h["ax"] = e.x; h["ay"] = e.y; self.da.queue_draw()
+    def _hoops_release(self, e):
+        h = self.hoops
+        if not h["aiming"]: return
+        h["aiming"] = False; h["scored"] = False; h["flying"] = True
+        h["vx"] = (h["bx"] - h["ax"]) * self.HOOPS_K
+        h["vy"] = (h["by"] - h["ay"]) * self.HOOPS_K
+        self._last_t = time.monotonic(); self.da.queue_draw()
+    def _hoops_reset_ball(self):
+        h = self.hoops
+        h.update(bx=80.0, by=150.0, vx=0.0, vy=0.0, flying=False, aiming=False, scored=False)
+    def _hoops_new_hoop(self):
+        h = self.hoops
+        h["hx"] = self.W - 68 + random.uniform(-8, 8); h["hy"] = 60 + random.random() * 34
+    def _hoops_tick(self, dt):
+        h = self.hoops
+        h["vy"] += self.HOOPS_G * dt
+        h["bx"] += h["vx"] * dt; h["by"] += h["vy"] * dt
+        # score: falling through the rim within its x-span
+        if (not h["scored"] and h["vy"] > 0 and h["hy"] - 6 < h["by"] < h["hy"] + 12
+                and h["hx"] - h["hw"] / 2 < h["bx"] < h["hx"] + h["hw"] / 2):
+            h["scored"] = True; h["score"] += 1; h["streak"] += 1
+            def _sc(): self._hoops_reset_ball(); self._hoops_new_hoop(); self.da.queue_draw(); return False
+            GLib.timeout_add(360, _sc)
+        # backboard bounce
+        boardx = h["hx"] + h["hw"] / 2 + 7
+        if h["bx"] + h["r"] > boardx and h["hy"] - 26 < h["by"] < h["hy"] + 22 and h["vx"] > 0:
+            h["vx"] *= -0.5; h["bx"] = boardx - h["r"]
+        # off-screen → miss
+        if h["by"] > self.H + 50 or h["bx"] > self.W + 60 or h["bx"] < -60:
+            if not h["scored"]: h["streak"] = 0
+            self._hoops_reset_ball()
+    def _draw_hoops(self, cr):
+        h = self.hoops; hx, hy, hw = h["hx"], h["hy"], h["hw"]
+        cr.set_source_rgba(1, 1, 1, 0.05)   # court dot grid
+        for gx in range(12, self.W, 24):
+            for gy in range(12, self.H, 24): cr.arc(gx, gy, 1, 0, 6.2832); cr.fill()
+        cr.set_source_rgba(1, 1, 1, 0.22); cr.set_line_width(2)   # backboard
+        cr.move_to(hx + hw / 2 + 7, hy - 26); cr.line_to(hx + hw / 2 + 7, hy + 22); cr.stroke()
+        cr.set_source_rgba(*self.R, 1); cr.set_line_width(3)      # rim
+        cr.move_to(hx - hw / 2, hy); cr.line_to(hx + hw / 2, hy); cr.stroke()
+        cr.set_source_rgba(1, 1, 1, 0.28)                          # net dots
+        for i in range(7): cr.arc(hx - hw / 2 + i * hw / 6, hy + 9, 1, 0, 6.2832); cr.fill()
+        if h["aiming"]:                                            # dotted aim preview
+            px, py = h["bx"], h["by"]
+            pvx = (h["bx"] - h["ax"]) * self.HOOPS_K; pvy = (h["by"] - h["ay"]) * self.HOOPS_K
+            cr.set_source_rgba(*self.R, 0.5)
+            for _ in range(22):
+                pvy += self.HOOPS_G * 0.045; px += pvx * 0.045; py += pvy * 0.045
+                if py > self.H or px > self.W or px < 0: break
+                cr.arc(px, py, 1.6, 0, 6.2832); cr.fill()
+        cr.set_source_rgba(*self.R, 1)                             # ball
+        cr.arc(h["bx"], h["by"], h["r"], 0, 6.2832); cr.fill()
+        cr.set_source_rgba(0, 0, 0, 0.4); cr.set_line_width(1)
+        cr.move_to(h["bx"] - h["r"], h["by"]); cr.line_to(h["bx"] + h["r"], h["by"]); cr.stroke()
+        self._text(cr, "%d · streak %d" % (h["score"], h["streak"]), self.W - 8, 16, 13, (0.55, 0.55, 0.6), 1)
 
     # ---- draw dispatch + helpers ----
     def _draw(self, da, cr):
