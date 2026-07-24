@@ -1,3 +1,6 @@
+-- ACCENT (rewritten by the PALETTE widget; keep this block shape)
+local AR, AG, AB = 0.290, 0.871, 0.502
+
 -- Nothing OS LIVE background: CPU-reactive dotted rings, a drifting dot field,
 -- and sonar pings that quicken under load. Rides on the static wallpaper.
 -- Requires conky built with Lua Cairo (conky-all).
@@ -39,7 +42,7 @@ function conky_bg()
         d.y = d.y + math.sin(d.a) * spd * 0.02
         if d.x < 0 then d.x = d.x + w elseif d.x > w then d.x = d.x - w end
         if d.y < 0 then d.y = d.y + h elseif d.y > h then d.y = d.y - h end
-        if d.red then cairo_set_source_rgba(cr, 0.84, 0.10, 0.13, 0.10 + 0.12 * load)
+        if d.red then cairo_set_source_rgba(cr, AR, AG, AB, 0.10 + 0.12 * load)
         else          cairo_set_source_rgba(cr, 0.80, 0.80, 0.85, 0.05 + 0.06 * load) end
         cairo_arc(cr, d.x, d.y, d.red and 1.6 or 1.2, 0, TWO_PI)
         cairo_fill(cr)
@@ -59,8 +62,8 @@ function conky_bg()
                 local alpha
                 if red then alpha = 0.10 + 0.22 * breath + 0.08 * load
                 else        alpha = 0.06 + 0.11 * breath + 0.05 * load end
-                cairo_set_source_rgba(cr, red and 0.84 or 0.80, red and 0.10 or 0.80,
-                                          red and 0.13 or 0.85, alpha)
+                cairo_set_source_rgba(cr, red and AR or 0.80, red and AG or 0.80,
+                                          red and AB or 0.85, alpha)
                 cairo_arc(cr, dx, dy, red and 1.6 or 1.3, 0, TWO_PI)
                 cairo_fill(cr)
             end
@@ -74,13 +77,13 @@ function conky_bg()
     local pa = (0.18 + 0.12 * load) * (1 - frac)
     if pa > 0.004 then
         cairo_set_line_width(cr, 1.4)
-        cairo_set_source_rgba(cr, 0.84, 0.10, 0.13, pa)
+        cairo_set_source_rgba(cr, AR, AG, AB, pa)
         cairo_arc(cr, cx, cy, pr, 0, TWO_PI)
         cairo_stroke(cr)
     end
 
     -- 4) pulsing core dot (grows with load)
-    cairo_set_source_rgba(cr, 0.84, 0.10, 0.13, 0.55 + 0.30 * math.sin(t * 1.4))
+    cairo_set_source_rgba(cr, AR, AG, AB, 0.55 + 0.30 * math.sin(t * 1.4))
     cairo_arc(cr, cx, cy, 2.6 + 2 * load, 0, TWO_PI)
     cairo_fill(cr)
 

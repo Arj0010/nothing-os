@@ -1,14 +1,56 @@
 #!/usr/bin/env python3
 """Nothing OS — interactive, movable desktop widgets (GTK3).
 Drag a widget by its body to move it (position persists); buttons stay clickable."""
-import gi, os, json, subprocess, math, time, random, urllib.request, glob, threading
+import gi, os, json, subprocess, math, time, random, urllib.request, glob, threading, shlex
 from collections import deque
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib, Pango  # noqa
 
-ACCENT   = "#D71921"
+# ---------- themes (live-swappable via the PALETTE card) ----------
+# disp = big numerals, label = small caps headings, mono = data/meters.
+NOTHING_FONTS = ('Ndot 57', 'NType 82', 'Lettera Mono LL')
+JB            = ('JetBrainsMono NF Light', 'JetBrainsMono NF Medium', 'JetBrainsMono NF')
+THEMES = {
+    "MONO RED":  dict(accent="#E5484D", text="#F2F2F2", dim="#9A9A9A", faint="#5E5E5E",
+                      base="rgba(9,9,10,0.88)", tile="#0A0A0A", hot="#160607",
+                      fonts=JB),
+    "NOTHING":   dict(accent="#D71921", text="#EDEDED", dim="#9A9A9A", faint="#5A5A5A",
+                      base="rgba(11,11,13,0.86)", tile="#0A0A0A", hot="#160607",
+                      fonts=NOTHING_FONTS),
+    "AMBER":     dict(accent="#F5A524", text="#EDEAE3", dim="#9A9488", faint="#5E5A52",
+                      base="rgba(12,11,9,0.88)", tile="#0B0A08", hot="#171006",
+                      fonts=JB),
+    "CYAN":      dict(accent="#22D3EE", text="#E8EDEF", dim="#8A9497", faint="#55605F",
+                      base="rgba(9,11,13,0.88)", tile="#080A0C", hot="#04141A",
+                      fonts=JB),
+    "PHOSPHOR":  dict(accent="#4ADE80", text="#E6EDE6", dim="#7F8C7F", faint="#4F5A4F",
+                      base="rgba(8,10,8,0.88)", tile="#070907", hot="#06160C",
+                      fonts=JB),
+    "MONOCHROME":dict(accent="#FFFFFF", text="#D8D8D8", dim="#7A7A7A", faint="#4E4E4E",
+                      base="rgba(10,10,10,0.88)", tile="#0A0A0A", hot="#1A1A1A",
+                      fonts=JB),
+}
+THEME_NAMES = list(THEMES)
+THEME_FILE  = os.path.expanduser("~/.config/nothing-widgets/theme.json")
+
+def load_theme_name():
+    try:
+        n = json.load(open(THEME_FILE)).get("theme")
+        if n in THEMES: return n
+    except Exception: pass
+    return "MONO RED"
+
+THEME_NAME = load_theme_name()
+T = THEMES[THEME_NAME]
+ACCENT = T["accent"]
+
+def rgb(hexcol):
+    h = hexcol.lstrip("#")
+    return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+
 CONF_DIR = os.path.expanduser("~/.config/nothing-widgets")
 POS_FILE = os.path.join(CONF_DIR, "positions.json")
+UI_FILE  = os.path.join(CONF_DIR, "ui-state.json")     # collapsed/expanded per widget
 os.makedirs(CONF_DIR, exist_ok=True)
 GLib.set_prgname("nothing-widget")   # stable WM_CLASS so the dock can skip our own windows
 
@@ -75,84 +117,204 @@ def save_pos(name, x, y):
     p = load_pos(); p[name] = [x, y]
     with open(POS_FILE, "w") as fh: json.dump(p, fh)
 
+# ---------- the single vertical pane ----------
+# Every card in PANE_ORDER is auto-stacked down one column: each sits directly
+# under the previous one, so collapsing a card pulls everything below it up and
+# no hole is ever left behind. Only the dock and the orb live outside the pane.
+PANE_X, PANE_TOP, PANE_GAP, PANE_W = 74, 16, 4, 452
+POPOUT_W = 460          # every rail pop-out shares this width
+NOTES_W  = 560          # Notes gets extra room to actually read/write
+PANE_ORDER = ["clock", "system", "status", "net", "now", "sessions"]
+# Everything else is reachable from the RAIL: a slim icon strip on the left edge.
+RAIL_ORDER = ["controls", "pomo", "calendar", "notes", "arcade"]
+PANE = {}          # wname -> Widget, filled as they are constructed
+
+def relayout_pane():
+    y = PANE_TOP
+    for name in PANE_ORDER:
+        w = PANE.get(name)
+        if w is None or not w.get_visible(): continue
+        cx, cy = w.get_position()
+        if (cx, cy) != (PANE_X, y):        # only move drifted cards → no flicker
+            w.move(PANE_X, y)
+        # Stack by the CONTENT height (natural preferred), not get_size(): the
+        # window's allocation can lag behind its real rendered height during
+        # startup, which used to place the next card too high and overlap it.
+        h = max(w.get_preferred_height()[1], w.get_size()[1])
+        y += h + PANE_GAP
+    return False
+
+def pane_keeper():
+    # Muffin re-maps sticky windows when you switch workspaces and can nudge them
+    # out of place — re-assert the stack a couple of times per switch, cheaply.
+    relayout_pane()
+    return True
+
+def schedule_relayout():
+    # after GTK has settled the new sizes, not during the resize itself
+    GLib.timeout_add(30, relayout_pane)
+
+# ---------- collapsed/expanded state ----------
+# Widgets that start life as a title bar; expand with the ▸ caret (state sticks).
+START_COLLAPSED = set()
+
+def load_ui():
+    try:
+        with open(UI_FILE) as fh: return json.load(fh)
+    except Exception: return {}
+
+def save_ui(name, collapsed):
+    s = load_ui(); s[name] = bool(collapsed)
+    try:
+        with open(UI_FILE, "w") as fh: json.dump(s, fh)
+    except Exception: pass
+
 # ---------- styling ----------
-CSS = ("""
-.card { background-color: rgba(11,11,13,0.86); border: 1px solid rgba(255,255,255,0.13);
-        border-radius: 8px; padding: 18px 20px; margin: 10px;
+CSS_T = """
+.card { background-color: %(base)s; border: 1px solid rgba(255,255,255,0.13);
+        border-radius: 8px; padding: 11px 14px; margin: 3px;
         transition: border-color 180ms ease, box-shadow 180ms ease; }
 .card:hover, .card.hov {
-        border-color: rgba(215,25,33,0.85);
-        background-color: rgba(22,7,8,0.93);
-        box-shadow: inset 0 0 34px rgba(215,25,33,0.32), 0 0 24px 3px rgba(215,25,33,0.38); }
-.sbar   { font-family:"DejaVu Sans Mono"; font-size:12px; letter-spacing:1px; }
-.calmonth { color:#ededed; font-family:"Ndot 57"; font-size:30px; letter-spacing:2px; }
-.calwd  { color:#6a6a6a; font-family:"NType 82"; font-size:11px; letter-spacing:1px; }
-.cal    { color:#c0c0c0; font-family:"Lettera Mono LL"; font-size:15px; }
+        border-color: %(a)s;
+        background-color: %(hot)s;
+        box-shadow: inset 0 0 34px %(a25)s, 0 0 24px 3px %(a30)s; }
+.sbar   { font-family:"%(mono)s"; font-size:14px; letter-spacing:1px; }
+.calmonth { color:%(text)s; font-family:"%(disp)s"; font-size:17px; letter-spacing:1px; }
+.calwd  { color:%(faint)s; font-family:"%(label)s"; font-size:11px; }
+.cal    { color:%(dim)s; font-family:"%(mono)s"; font-size:13px; }
 .calcell { background-color:transparent; border:1px solid transparent; border-radius:5px;
-           color:#c0c0c0; font-family:"Lettera Mono LL"; font-size:15px; padding:0; }
-.calcell:hover { border-color:%(a)s; color:#ffffff;
-                 background-color:rgba(22,7,8,0.9);
-                 box-shadow: inset 0 0 12px rgba(215,25,33,0.30); }
-.calcell.today { color:#ffffff; background-color:%(a)s; border-color:%(a)s; }
-.calinfo { color:#6a6a6a; font-family:"Lettera Mono LL"; font-size:11px; letter-spacing:1px; }
-.title  { color:#707070; font-family:"NType 82"; font-size:12px; letter-spacing:3px; }
-.hdot   { color:%(a)s; font-family:"DejaVu Sans Mono"; font-size:11px; }
+           color:%(dim)s; font-family:"%(mono)s"; font-size:13px; padding:0; }
+.calcell:hover { border-color:%(a)s; color:#ffffff; background-color:%(hot)s; }
+.calcell.today { color:#0a0a0a; background-color:%(a)s; border-color:%(a)s; }
+.calinfo { color:%(faint)s; font-family:"%(mono)s"; font-size:11px; }
+.title  { color:%(dim)s; font-family:"%(label)s"; font-size:12px; letter-spacing:2px; }
+.hdot   { color:%(a)s; font-family:"%(mono)s"; font-size:13px; }
 .rule   { background-color: rgba(255,255,255,0.07); min-height:1px; }
-.clock  { color:#f2f2f2; font-family:"Ndot 57"; font-size:104px; }
-.csec   { color:%(a)s; font-family:"Ndot 57"; font-size:34px; }
-.date   { color:#8a8a8a; font-family:"Ndot 57"; font-size:26px; letter-spacing:3px; }
-.k      { color:#8a8a8a; font-family:"NType 82"; font-size:13px; letter-spacing:2px; }
-.v      { color:#ededed; font-family:"Lettera Mono LL"; font-size:14px; }
-.meter  { font-family:"DejaVu Sans Mono"; font-size:15px; color:#e8e8e8; }
+.clock  { color:%(text)s; font-family:"%(disp)s"; font-size:52px; }
+.csec   { color:%(a)s; font-family:"%(disp)s"; font-size:19px; }
+.date   { color:%(dim)s; font-family:"%(disp)s"; font-size:15px; letter-spacing:1px; }
+.k      { color:%(dim)s; font-family:"%(label)s"; font-size:12px; letter-spacing:1px; }
+.v      { color:%(text)s; font-family:"%(mono)s"; font-size:13px; }
+.meter  { font-family:"%(mono)s"; font-size:13px; color:%(text)s; }
 .meter.hot { color:%(a)s; }
-.big    { color:#ededed; font-family:"Ndot 57"; font-size:30px; }
-.dim    { color:#9a9a9a; font-family:"Lettera Mono LL"; font-size:13px; }
-.faint  { color:#5a5a5a; font-family:"Lettera Mono LL"; font-size:12px; }
-.dotlit { color:%(a)s; font-family:"DejaVu Sans Mono"; font-size:10px; }
-.dotidle{ color:#3a3a3a; font-family:"DejaVu Sans Mono"; font-size:10px; }
-.tile   { background-color:#0a0a0a; border:1px solid rgba(255,255,255,0.08); border-radius:5px;
-          color:#8a8a8a; font-family:"NType 82"; font-size:13px; letter-spacing:2px; padding:16px 14px; }
-.tile:hover { border-color:%(a)s; color:#ededed; box-shadow: 0 0 12px 0 rgba(215,25,33,0.22); }
-.tile.on { background-color:#160607; border-color:%(a)s; color:#f2f2f2; }
-.app    { background-color:#0a0a0a; border:1px solid rgba(255,255,255,0.08); border-radius:8px;
+.big    { color:%(text)s; font-family:"%(disp)s"; font-size:17px; }
+.dim    { color:%(dim)s; font-family:"%(mono)s"; font-size:12px; }
+.faint  { color:%(faint)s; font-family:"%(mono)s"; font-size:12px; }
+.dotlit { color:%(a)s; font-family:"%(mono)s"; font-size:12px; }
+.dotidle{ color:#3a3a3a; font-family:"%(mono)s"; font-size:12px; }
+.tile   { background-color:%(tile)s; border:1px solid rgba(255,255,255,0.08); border-radius:5px;
+          color:%(dim)s; font-family:"%(label)s"; font-size:12px; letter-spacing:1px; padding:7px 6px; }
+.tile:hover { border-color:%(a)s; color:%(text)s; box-shadow: 0 0 12px 0 %(a25)s; }
+.tile.on { background-color:%(hot)s; border-color:%(a)s; color:%(text)s; }
+.app    { background-color:%(tile)s; border:1px solid rgba(255,255,255,0.08); border-radius:8px;
           padding:10px 8px 7px;
           transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease; }
-.app:hover { border-color:%(a)s; background-color:#160607; box-shadow: 0 0 16px 1px rgba(215,25,33,0.34); }
-.applabel { color:#9a9a9a; font-family:"NType 82"; font-size:10px; letter-spacing:1px; }
+.app:hover { border-color:%(a)s; background-color:%(hot)s; box-shadow: 0 0 16px 1px %(a30)s; }
+.applabel { color:%(dim)s; font-family:"%(label)s"; font-size:12px; letter-spacing:1px; }
 .app:hover .applabel { color:#ffffff; }
-.rundot   { color:%(a)s; font-family:"DejaVu Sans Mono"; font-size:9px; }
-.rundotoff{ color:#2c2c2c; font-family:"DejaVu Sans Mono"; font-size:9px; }
+.rundot   { color:%(a)s; font-family:"%(mono)s"; font-size:11px; }
+.rundotoff{ color:#2c2c2c; font-family:"%(mono)s"; font-size:11px; }
 .dockbar  { background-color: rgba(17,17,20,0.80); border:1px solid rgba(255,255,255,0.12);
             border-radius: 22px; padding: 7px 12px; }
 .dapp     { background-color:transparent; border:0; border-radius:14px; padding:2px 5px;
             transition: background-color 140ms ease; }
 .dapp:hover { background-color: rgba(255,255,255,0.09); }
-.viz      { font-family:"DejaVu Sans Mono"; font-size:22px; color:%(a)s; letter-spacing:1px; }
-.vizoff   { font-family:"DejaVu Sans Mono"; font-size:22px; color:#333333; letter-spacing:1px; }
-.clock2   { color:#f2f2f2; font-family:"Ndot 57"; font-size:60px; }
-.notes, .notes text { background-color:transparent; color:#d8d8d8;
-            font-family:"Lettera Mono LL"; font-size:14px; caret-color:%(a)s; }
-.chat, .chat text { background-color:transparent; color:#d0d0d0;
-            font-family:"Lettera Mono LL"; font-size:13px; }
-.chatin, .chatin text { background-color:#0a0a0a; color:#ededed; caret-color:%(a)s;
-            font-family:"Lettera Mono LL"; font-size:13px; border:1px solid rgba(255,255,255,0.12);
+.viz      { font-family:"%(mono)s"; font-size:22px; color:%(a)s; letter-spacing:1px; }
+.vizoff   { font-family:"%(mono)s"; font-size:22px; color:#333333; letter-spacing:1px; }
+.clock2   { color:%(text)s; font-family:"%(disp)s"; font-size:34px; }
+.notes, .notes text { background-color:transparent; color:%(text)s;
+            font-family:"%(mono)s"; font-size:13px; caret-color:%(a)s; }
+.chat, .chat text { background-color:transparent; color:%(dim)s;
+            font-family:"%(mono)s"; font-size:15px; }
+.chatin, .chatin text { background-color:%(tile)s; color:%(text)s; caret-color:%(a)s;
+            font-family:"%(mono)s"; font-size:15px; border:1px solid rgba(255,255,255,0.12);
             border-radius:6px; padding:7px 10px; }
 .chatin:focus { border-color:%(a)s; }
-.sendbtn { background-color:#160607; border:1px solid %(a)s; border-radius:6px;
-            color:#f2f2f2; font-family:"NType 82"; font-size:12px; letter-spacing:2px; padding:7px 16px; }
+.sendbtn { background-color:%(hot)s; border:1px solid %(a)s; border-radius:6px;
+            color:%(text)s; font-family:"%(label)s"; font-size:14px; letter-spacing:2px; padding:7px 16px; }
 .sendbtn:hover { background-color:%(a)s; }
-.chatq { color:%(a)s; font-family:"NType 82"; font-size:11px; letter-spacing:1px; }
-.chata { color:#cfcfcf; font-family:"Lettera Mono LL"; font-size:13px; }
-.chatsys { color:#6a6a6a; font-family:"Lettera Mono LL"; font-size:11px; }
-.media  { background-color:transparent; border:0; color:#9a9a9a;
-          font-family:"DejaVu Sans Mono"; font-size:20px; padding:2px 12px; }
+.chatq { color:%(a)s; font-family:"%(label)s"; font-size:13px; letter-spacing:1px; }
+.chata { color:%(dim)s; font-family:"%(mono)s"; font-size:15px; }
+.chatsys { color:%(faint)s; font-family:"%(mono)s"; font-size:13px; }
+.media  { background-color:transparent; border:0; color:%(dim)s;
+          font-family:"%(mono)s"; font-size:18px; padding:1px 11px; }
 .media:hover { color:%(a)s; }
-""" % {"a": ACCENT}).encode()
+.caret  { background-color:transparent; border:0; color:%(dim)s; padding:0 6px 0 0;
+          font-family:"%(mono)s"; font-size:14px; }
+.caret:hover { color:%(a)s; }
+/* --- SESSIONS timeline --- */
+.srow   { background-color:transparent; border:0; border-radius:5px; padding:3px 6px;
+          transition: background-color 140ms ease; }
+.srow:hover { background-color:%(a15)s; }
+.srow.child { padding:1px 6px 1px 14px; }
+.scount { background-color:transparent; border:1px solid rgba(255,255,255,0.14);
+          border-radius:9px; color:%(dim)s; padding:0 6px; margin-left:4px;
+          font-family:"%(mono)s"; font-size:11px; }
+.scount:hover { border-color:%(a)s; color:%(text)s; }
+.stime  { color:%(dim)s; font-family:"%(mono)s"; font-size:12px; }
+.sdir   { color:%(text)s; font-family:"%(label)s"; font-size:13px; letter-spacing:1px; }
+.stask  { color:%(dim)s; font-family:"%(mono)s"; font-size:12px; }
+.srail  { color:#3a3a3a; font-family:"%(mono)s"; font-size:14px; }
+.srail.live { color:%(a)s; }
+/* --- floating Jarvis orb --- */
+.orb    { background-color:%(base)s; border:1px solid %(a)s; border-radius:26px; padding:0; }
+.orb:hover { background-color:%(hot)s; box-shadow: 0 0 20px 2px %(a30)s; }
+.orbicon { color:%(a)s; font-family:"%(mono)s"; font-size:17px; }
+/* --- RAIL (slim launcher strip) --- */
+.railbar { background-color:%(base)s; border:1px solid rgba(255,255,255,0.11);
+           border-radius:20px; padding:8px 5px; }
+.railbtn { background-color:transparent; border:1px solid transparent; border-radius:12px;
+           color:%(dim)s; font-family:"%(mono)s"; font-size:16px; padding:6px 7px;
+           transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease; }
+.railbtn:hover { background-color:rgba(255,255,255,0.08); color:%(text)s; }
+.railbtn.on { color:%(a)s; border-color:%(a)s; background-color:%(hot)s; }
+.railtag { color:%(faint)s; font-family:"%(mono)s"; font-size:10px; }
+/* --- PALETTE picker --- */
+.swatch { border:1px solid rgba(255,255,255,0.18); border-radius:6px; padding:0;
+          transition: border-color 140ms ease, box-shadow 140ms ease; }
+.swatch:hover { border-color:#ffffff; }
+.swatch.on { border-color:%(a)s; box-shadow: 0 0 10px 1px %(a30)s; }
+.swname { color:%(dim)s; font-family:"%(label)s"; font-size:11px; letter-spacing:1px; }
+"""
 
+def _alpha(hexcol, a):
+    r, g, b = [int(round(v * 255)) for v in rgb(hexcol)]
+    return "rgba(%d,%d,%d,%.2f)" % (r, g, b, a)
+
+def build_css(t):
+    disp, label, mono = t["fonts"]
+    return (CSS_T % {"a": t["accent"], "text": t["text"], "dim": t["dim"],
+                     "faint": t["faint"], "base": t["base"], "tile": t["tile"],
+                     "hot": t["hot"], "disp": disp, "label": label, "mono": mono,
+                     "a15": _alpha(t["accent"], 0.15), "a25": _alpha(t["accent"], 0.25),
+                     "a30": _alpha(t["accent"], 0.34)}).encode()
+
+_PROVIDER = None
 def apply_css():
-    prov = Gtk.CssProvider(); prov.load_from_data(CSS)
-    Gtk.StyleContext.add_provider_for_screen(
-        Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+    global _PROVIDER
+    scr = Gdk.Screen.get_default()
+    if _PROVIDER is not None:
+        Gtk.StyleContext.remove_provider_for_screen(scr, _PROVIDER)
+    _PROVIDER = Gtk.CssProvider(); _PROVIDER.load_from_data(build_css(T))
+    Gtk.StyleContext.add_provider_for_screen(scr, _PROVIDER, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+def set_theme(name):
+    """Swap the palette live: restyle every widget, no restart."""
+    global THEME_NAME, T, ACCENT
+    if name not in THEMES: return
+    THEME_NAME = name; T = THEMES[name]; ACCENT = T["accent"]
+    try: json.dump({"theme": name}, open(THEME_FILE, "w"))
+    except Exception: pass
+    apply_css()
+    for fn in THEME_HOOKS:
+        try: fn()
+        except Exception: pass
+    # retint the wallpaper + conky animation to match (runs in the background)
+    script = os.path.expanduser("~/.config/conky/nothing/theme-apply.sh")
+    if os.path.exists(script):
+        sh("%s %s" % (shlex.quote(script), shlex.quote(T["accent"])))
+
+THEME_HOOKS = []   # widgets that paint themselves (Arcade, chat tags) re-read ACCENT
 
 # ---------- base widget window ----------
 class Widget(Gtk.Window):
@@ -174,13 +336,21 @@ class Widget(Gtk.Window):
         self.set_app_paintable(True)
         vis = self.get_screen().get_rgba_visual()
         if vis: self.set_visual(vis)
-        if w: self.set_size_request(w, -1)
+        self.in_pane = name in PANE_ORDER
+        if self.in_pane:
+            PANE[name] = self
+            self.set_size_request(PANE_W, -1)
+        elif w:
+            self.set_size_request(w, -1)
         self._last_press = 0
         self._cardbox = None
         self._armed = False; self._moved = False
         self._px = self._py = 0; self._save_scheduled = False
-        pos = load_pos().get(name, [x, y])
-        self.move(pos[0], pos[1])
+        if self.in_pane:
+            self.move(PANE_X, y)      # real slot assigned by relayout_pane()
+        else:
+            pos = load_pos().get(name, [x, y])
+            self.move(pos[0], pos[1])
         self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
                         | Gdk.EventMask.BUTTON_RELEASE_MASK
                         | Gdk.EventMask.POINTER_MOTION_MASK
@@ -248,6 +418,8 @@ class Widget(Gtk.Window):
         return False
 
     def _configure(self, w, e):
+        # pane cards are placed by relayout_pane(); their position isn't theirs to keep
+        if self.in_pane: return False
         # persist position after a move, throttled to one write per move
         if not self._save_scheduled:
             self._save_scheduled = True
@@ -259,14 +431,55 @@ class Widget(Gtk.Window):
         x, y = self.get_position(); save_pos(self.wname, x, y)
         return False
 
-    def header(self, text):
+    def header(self, text, collapsible=False, body=None, subtitle=None):
         box = Gtk.Box(spacing=8)
+        if collapsible:
+            self._caret = Gtk.Button(label="▾")
+            self._caret.get_style_context().add_class("caret")
+            self._caret.set_relief(Gtk.ReliefStyle.NONE)
+            self._caret.connect("clicked", lambda *_: self.toggle_collapse())
+            box.pack_start(self._caret, False, False, 0)
         lbl = L(text, "title"); lbl.set_hexpand(True); lbl.set_xalign(0)
         dot = L("●", "hdot"); dot.set_valign(Gtk.Align.CENTER)
         HDOTS.append(dot)   # pulsed together by start_pulse()
         box.pack_start(lbl, True, True, 0)
+        if subtitle is not None:
+            self._subtitle = subtitle; box.pack_end(subtitle, False, False, 0)
         box.pack_end(dot, False, False, 0)
+        if collapsible:
+            self._body = body
+            self._titlelbl = lbl
         return box
+
+    # ---- collapse / expand -------------------------------------------------
+    # The body Box is hidden and the window shrinks to its title bar. Position
+    # is untouched, so a card expands back into the same slot it came from.
+    _body = None; _caret = None; _collapsed = False
+
+    def setup_collapse(self, body, default=None):
+        """Call after add(); `body` is hidden when collapsed."""
+        self._body = body
+        want = load_ui().get(self.wname,
+                             self.wname in START_COLLAPSED if default is None else default)
+        if want: GLib.idle_add(self._apply_collapse, True, False)
+
+    def toggle_collapse(self, *_):
+        self._apply_collapse(not self._collapsed, True)
+
+    def _apply_collapse(self, collapsed, persist):
+        if self._body is None: return False
+        self._collapsed = collapsed
+        self._body.set_visible(not collapsed)
+        self._body.set_no_show_all(collapsed)
+        if self._caret: self._caret.set_label("▸" if collapsed else "▾")
+        self.resize(1, 1)                      # let the window shrink to the header
+        if persist: save_ui(self.wname, collapsed)
+        self.on_collapse(collapsed)            # subclasses pause work while hidden
+        schedule_relayout()                    # close the gap this just opened
+        return False
+
+    def on_collapse(self, collapsed):
+        pass
 
 def L(text, cls, xalign=0):
     lbl = Gtk.Label(label=text, xalign=xalign)
@@ -303,7 +516,7 @@ class Clock(Widget):
     def __init__(self):
         super().__init__("clock", 50, 40, 600)
         self.action = "gnome-calendar"
-        b = vbox(8, m=24)
+        b = vbox(7, m=24)
         top = Gtk.Box(spacing=10); top.set_valign(Gtk.Align.END)
         self.time = L("--:--", "clock")
         self.sec  = L("00", "csec"); self.sec.set_valign(Gtk.Align.END)
@@ -322,7 +535,7 @@ class Clock(Widget):
         t = time.localtime()
         self.time.set_text(time.strftime("%H:%M", t))
         self.sec.set_text(time.strftime("%S", t))
-        self.secbar.set_markup(two_tone(t.tm_sec / 60 * 100, 44))
+        self.secbar.set_markup(two_tone(t.tm_sec / 60 * 100, 30))
         hh = t.tm_hour
         greet = ("GOOD MORNING" if hh < 12 else "GOOD AFTERNOON" if hh < 17
                  else "GOOD EVENING" if hh < 21 else "GOOD NIGHT")
@@ -333,8 +546,8 @@ class Clock(Widget):
 class Controls(Widget):
     def __init__(self):
         super().__init__("controls", 1130, 40, 710)
-        b = vbox(12, m=22); b.pack_start(self.header("QUICK CONTROLS"), False, False, 0)
-        grid = Gtk.Grid(row_spacing=11, column_spacing=11)
+        b = vbox(11, m=22); b.pack_start(self.header("QUICK CONTROLS"), False, False, 0)
+        grid = Gtk.Grid(row_spacing=5, column_spacing=5)
         grid.set_column_homogeneous(True); grid.set_row_homogeneous(True)
         self.tiles = {}
         defs = [("wifi","WI-FI",0,0),("bt","BLUETOOTH",0,1),
@@ -343,7 +556,7 @@ class Controls(Widget):
             btn = Gtk.Button(label=label); btn.get_style_context().add_class("tile")
             btn.set_relief(Gtk.ReliefStyle.NONE)
             btn.set_hexpand(True); btn.set_vexpand(True)
-            btn.set_size_request(-1, 66)
+            btn.set_size_request(-1, 52)
             btn.connect("clicked", self.toggle, key)
             self.tiles[key] = btn; grid.attach(btn, c, r, 1, 1)
         b.pack_start(grid, True, True, 0)
@@ -380,14 +593,14 @@ class System(Widget):
     def __init__(self):
         super().__init__("system", 50, 356, 600)
         self.action = "gnome-system-monitor"
-        b = vbox(9, m=22); b.pack_start(self.header("SYSTEM · i5-1135G7"), False, False, 0)
+        b = vbox(8, m=22); b.pack_start(self.header("SYSTEM · i5-1135G7"), False, False, 0)
         self.rows = {}
-        self.hist = {"CPU": deque(maxlen=34), "RAM": deque(maxlen=34)}
+        self.hist = {"CPU": deque(maxlen=26), "RAM": deque(maxlen=26)}
         for k in ("CPU","RAM","TMP","BAT"):
             row = Gtk.Box(spacing=18)
-            key = L(k, "k"); key.set_size_request(44,-1)
+            key = L(k, "k"); key.set_size_request(32,-1)
             meter = L("", "meter"); meter.set_xalign(0)
-            val = L("", "dim"); val.set_xalign(1); val.set_size_request(72,-1)
+            val = L("", "dim"); val.set_xalign(1); val.set_size_request(54,-1)
             row.pack_start(key, False, False, 0)
             row.pack_start(meter, False, False, 0)
             row.pack_end(val, False, False, 0)
@@ -441,7 +654,7 @@ class System(Widget):
                 self.hist[k].append(int(data[k]) if data[k].isdigit() else 0)
                 meter.set_text(spark(self.hist[k], 100))
             else:                # TMP / BAT → steady dotted meter
-                meter.set_text(dots(data[k], 30))
+                meter.set_text(dots(data[k], 22))
             txt = data[k]+unit[k]
             if k=="BAT" and chg: txt += " +"
             val.set_text(txt)
@@ -454,7 +667,7 @@ class Network(Widget):
     def __init__(self):
         super().__init__("net", 1130, 344, 710)
         self.action = "cinnamon-settings network"
-        b = vbox(9, m=22); b.pack_start(self.header("NETWORK"), False, False, 0)
+        b = vbox(8, m=22); b.pack_start(self.header("NETWORK"), False, False, 0)
         self.iface = out("ip route 2>/dev/null | awk '/default/{print $5; exit}'") or "wlp0s20f3"
         self.ssid = self._kv(b, "SSID")
         self.ip   = self._kv(b, "LOCAL IP")
@@ -463,13 +676,13 @@ class Network(Widget):
         sp.pack_start(self.down, False, False, 0)
         sp.pack_start(self.up, False, False, 0)
         sp.set_margin_top(2); b.pack_start(sp, False, False, 0)
-        self.nhist = deque(maxlen=42)
+        self.nhist = deque(maxlen=26)
         self.nspark = L("", "meter"); self.nspark.set_xalign(0); self.nspark.set_margin_top(2)
         b.pack_start(self.nspark, False, False, 0)
         self.add(b); self._rx=self._tx=None; self.first(self.tick); GLib.timeout_add(2000, self.tick)
     def _kv(self, b, k):
         row = Gtk.Box(spacing=14)
-        key = L(k, "k"); key.set_size_request(96,-1)
+        key = L(k, "k"); key.set_size_request(66,-1)
         val = L("—", "v"); val.set_hexpand(True); val.set_xalign(1)
         row.pack_start(key, False, False, 0); row.pack_end(val, True, True, 0)
         b.pack_start(row, False, False, 0); return val
@@ -500,8 +713,8 @@ def human(n):
 class NowPlaying(Widget):
     def __init__(self):
         super().__init__("now", 1130, 560, 710)
-        b = vbox(10, m=22); b.pack_start(self.header("NOW PLAYING"), False, False, 0)
-        self.track = L("—", "dim"); self.track.set_line_wrap(True); self.track.set_max_width_chars(48)
+        b = vbox(9, m=22); b.pack_start(self.header("NOW PLAYING"), False, False, 0)
+        self.track = L("—", "dim"); self.track.set_line_wrap(True); self.track.set_max_width_chars(34)
         self.track.set_xalign(0)
         b.pack_start(self.track, False, False, 0)
         self.viz = L("", "vizoff"); self.viz.set_xalign(0); self.viz.set_margin_top(4)
@@ -513,7 +726,7 @@ class NowPlaying(Widget):
             btn.connect("clicked", lambda w,c=cmd: sh("playerctl "+c))
             ctrl.pack_start(btn, False, False, 0)
         b.pack_start(ctrl, False, False, 0)
-        self._bars = [0.05] * 30; self._playing = False
+        self._bars = [0.05] * 22; self._playing = False
         self.add(b); self.first(self.tick); GLib.timeout_add(2000, self.tick)
         GLib.timeout_add(90, self._animate)
     def _animate(self):
@@ -542,7 +755,7 @@ class Status(Widget):
     def __init__(self):
         super().__init__("status", 50, 636, 600)
         self.action = "gnome-system-monitor"
-        b = vbox(9, m=22); b.pack_start(self.header("SYSTEM :// STATUS"), False, False, 0)
+        b = vbox(8, m=22); b.pack_start(self.header("SYSTEM :// STATUS"), False, False, 0)
         self.line = L("", "faint"); self.line.set_xalign(0)
         b.pack_start(self.line, False, False, 0)
         self.svc = Gtk.Box(spacing=18); self.dots = {}
@@ -695,9 +908,13 @@ class Calendar(Widget):
         self.action = "gnome-calendar"
         import calendar, datetime
         today = datetime.date.today()
-        b = vbox(8, m=22); b.pack_start(self.header("CALENDAR"), False, False, 0)
-        b.pack_start(L(today.strftime("%B %Y").upper(), "calmonth"), False, False, 0)
-        grid = Gtk.Grid(row_spacing=6, column_spacing=6); grid.set_column_homogeneous(True)
+        # collapsed, the header keeps today's date visible so the card still informs
+        sub = L(today.strftime("%a %d %b").upper(), "calinfo")
+        b = vbox(7, m=22)
+        b.pack_start(self.header("CALENDAR", collapsible=True, subtitle=sub), False, False, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        body.pack_start(L(today.strftime("%B %Y").upper(), "calmonth"), False, False, 0)
+        grid = Gtk.Grid(row_spacing=2, column_spacing=2); grid.set_column_homogeneous(True)
         for c, w in enumerate(("MO","TU","WE","TH","FR","SA","SU")):
             grid.attach(L(w, "calwd", 0.5), c, 0, 1, 1)
         for r, week in enumerate(calendar.monthcalendar(today.year, today.month), start=1):
@@ -710,22 +927,24 @@ class Calendar(Widget):
                     ctx = cell.get_style_context(); ctx.add_class("calcell")
                     if day == today.day: ctx.add_class("today")
                     cell.connect("clicked", lambda *a: sh("gnome-calendar"))
-                cell.set_size_request(44, 30)
+                cell.set_size_request(52, 34)
                 grid.attach(cell, c, r, 1, 1)
-        b.pack_start(grid, False, False, 0)
+        body.pack_start(grid, False, False, 0)
         # offline "agenda": derived facts, no external data needed
         wk = today.isocalendar()[1]; doy = today.timetuple().tm_yday
         yr_days = 366 if calendar.isleap(today.year) else 365
         left = calendar.monthrange(today.year, today.month)[1] - today.day
         info = L("WEEK %02d · DAY %d/%d · %d LEFT IN MONTH" % (wk, doy, yr_days, left), "calinfo")
-        info.set_margin_top(4); b.pack_start(info, False, False, 0)
+        info.set_margin_top(4); body.pack_start(info, False, False, 0)
+        b.pack_start(body, False, False, 0)
         self.add(b)
+        self.setup_collapse(body)
 
 # ---------- LOCAL MODEL (Ollama + iGPU) ----------
 class LLMStatus(Widget):
     def __init__(self):
         super().__init__("llm", 690, 300, 420)   # fills the empty centre
-        b = vbox(9, m=22); b.pack_start(self.header("LOCAL MODEL"), False, False, 0)
+        b = vbox(8, m=22); b.pack_start(self.header("LOCAL MODEL"), False, False, 0)
         self.model = L("— idle —", "big"); self.model.set_xalign(0)
         self.model.set_ellipsize(Pango.EllipsizeMode.END); self.model.set_max_width_chars(22)
         b.pack_start(self.model, False, False, 0)
@@ -783,7 +1002,7 @@ class Pomodoro(Widget):
     def __init__(self):
         super().__init__("pomo", 735, 40, 350)
         self.remaining = self.WORK; self.running = False; self._timer = None
-        b = vbox(8, m=22); b.pack_start(self.header("FOCUS"), False, False, 0)
+        b = vbox(7, m=22); b.pack_start(self.header("FOCUS"), False, False, 0)
         self.disp = L("25:00", "clock2"); self.disp.set_xalign(0)
         b.pack_start(self.disp, False, False, 0)
         self.bar = Gtk.Label(); self.bar.set_xalign(0)
@@ -793,14 +1012,20 @@ class Pomodoro(Widget):
         self.startbtn = Gtk.Button(label="START")
         self.startbtn.get_style_context().add_class("tile")
         self.startbtn.set_relief(Gtk.ReliefStyle.NONE)
-        self.startbtn.set_size_request(-1, 42); self.startbtn.set_hexpand(True)
+        self.startbtn.set_size_request(-1, 38); self.startbtn.set_hexpand(True)
         self.startbtn.connect("clicked", self._toggle)
         rb = Gtk.Button(label="RESET"); rb.get_style_context().add_class("tile")
-        rb.set_relief(Gtk.ReliefStyle.NONE); rb.set_size_request(-1, 42); rb.set_hexpand(True)
+        rb.set_relief(Gtk.ReliefStyle.NONE); rb.set_size_request(-1, 38); rb.set_hexpand(True)
         rb.connect("clicked", self._reset)
         ctrl.pack_start(self.startbtn, True, True, 0); ctrl.pack_start(rb, True, True, 0)
         b.pack_start(ctrl, False, False, 0)
         self.add(b); self._render()
+        # start counting down on its own once the desktop is up
+        GLib.idle_add(self._autostart)
+
+    def _autostart(self):
+        if not self.running: self._toggle()
+        return False
     def _toggle(self, *_):
         self.running = not self.running
         self.startbtn.set_label("PAUSE" if self.running else "START")
@@ -822,14 +1047,250 @@ class Pomodoro(Widget):
     def _render(self):
         m, s = divmod(self.remaining, 60)
         self.disp.set_text("%02d:%02d" % (m, s))
-        self.bar.set_markup(two_tone((self.WORK - self.remaining) / self.WORK * 100, 38))
+        self.bar.set_markup(two_tone((self.WORK - self.remaining) / self.WORK * 100, 28))
+
+# ---------- CLAUDE SESSIONS (timeline; click to resume) ----------
+class Sessions(Widget):
+    """Recent `claude` sessions as a timeline. Click a row to reopen that exact
+    conversation: a terminal in the session's cwd running `claude --resume <id>`."""
+    ROOT     = os.path.expanduser("~/.claude/projects")
+    CACHE    = os.path.join(CONF_DIR, "sessions-cache.json")
+    ROWS     = 60       # keep them all — the list scrolls, so nothing is dropped
+    HEAD_MAX = 400      # lines to scan per file — cwd + first prompt are near the top
+    VIEW_H   = 158      # scroll viewport height (Sessions is last in the pane; this
+                        # is the room left down to the screen edge — scroll for more)
+
+    def __init__(self):
+        super().__init__("sessions", 690, 300, 440)
+        self._sig = None; self._open = {}; self._last_items = []
+        self._cache = self._load_cache()
+        b = vbox(6, m=18)
+        b.pack_start(self.header("SESSIONS"), False, False, 0)
+        b.pack_start(rule(), False, False, 0)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        # scrollable viewport: every project/run is reachable by scrolling down,
+        # while the card itself stays a fixed height so it never shoves the pane.
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scroll.set_min_content_height(self.VIEW_H)
+        self.scroll.set_max_content_height(self.VIEW_H)
+        self.scroll.set_propagate_natural_height(False)
+        self.scroll.get_style_context().add_class("chat")   # transparent bg
+        self.scroll.add(self.list)
+        b.pack_start(self.scroll, True, True, 0)
+        self.foot = L("— scanning —", "faint"); self.foot.set_xalign(0)
+        self.foot.set_margin_top(4)
+        b.pack_start(self.foot, False, False, 0)
+        self.add(b)
+        self.first(self.refresh); GLib.timeout_add(20000, self.refresh)
+
+    # ---- cache: parsing a 20MB transcript on every tick would stall the UI ----
+    def _load_cache(self):
+        try:
+            with open(self.CACHE) as fh: return json.load(fh)
+        except Exception: return {}
+
+    def _save_cache(self):
+        try:
+            with open(self.CACHE, "w") as fh: json.dump(self._cache, fh)
+        except Exception: pass
+
+    def _parse(self, path):
+        """cwd + first real user prompt. Only the head of the file is read."""
+        cwd = None; task = None
+        try:
+            with open(path, errors="replace") as fh:
+                for i, ln in enumerate(fh):
+                    if i > self.HEAD_MAX or (cwd and task): break
+                    try: o = json.loads(ln)
+                    except Exception: continue
+                    cwd = cwd or o.get("cwd")
+                    if task is None and o.get("type") == "user":
+                        c = (o.get("message") or {}).get("content")
+                        if isinstance(c, list):
+                            c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+                        if isinstance(c, str):
+                            c = c.strip()
+                            # skip hook/system injections and slash commands
+                            if c and not c.startswith(("<", "/")):
+                                task = " ".join(c.split())[:120]
+        except Exception: pass
+        return cwd, task
+
+    def _scan(self):
+        items = []
+        for path in glob.glob(os.path.join(self.ROOT, "*", "*.jsonl")):
+            try: mt = os.path.getmtime(path)
+            except OSError: continue
+            ent = self._cache.get(path)
+            if not ent or ent.get("mt") != mt:
+                cwd, task = self._parse(path)
+                ent = {"mt": mt, "cwd": cwd, "task": task,
+                       "sid": os.path.basename(path)[:-6]}
+                self._cache[path] = ent
+            items.append(ent)
+        items.sort(key=lambda e: e["mt"], reverse=True)
+        # drop cache entries for transcripts that no longer exist
+        for k in [k for k in self._cache if not os.path.exists(k)]:
+            self._cache.pop(k, None)
+        self._save_cache()
+        # One row per project: many runs of local-jarvis shouldn't crowd out
+        # everything else. Newest run represents the group; the rest fold under it.
+        groups = {}
+        for e in items:
+            cwd = e.get("cwd") or os.path.expanduser("~")
+            groups.setdefault(cwd, []).append(e)
+        out = []
+        for cwd, runs in groups.items():
+            runs.sort(key=lambda e: e["mt"], reverse=True)
+            out.append({"cwd": cwd, "mt": runs[0]["mt"], "runs": runs})
+        out.sort(key=lambda g: g["mt"], reverse=True)
+        return out[:self.ROWS]
+
+    @staticmethod
+    def _label(cwd):
+        # Name each row by WHERE claude ran, readably: "HOME" instead of a bare
+        # "~", and the last two path parts (parent/dir) so nested projects don't
+        # collapse to an ambiguous single word.
+        home = os.path.expanduser("~")
+        cwd = cwd.rstrip("/")
+        if cwd == home: return "HOME"
+        rel = cwd[len(home) + 1:] if cwd.startswith(home + "/") else cwd.lstrip("/")
+        parts = [p for p in rel.split("/") if p]
+        if not parts: return "HOME"
+        return "/".join(parts[-2:])
+
+    def refresh(self):
+        threading.Thread(target=self._scan_bg, daemon=True).start()
+        return True
+
+    def _scan_bg(self):
+        try: items = self._scan()
+        except Exception: items = []
+        GLib.idle_add(self._render, items)
+
+    def _render(self, items):
+        sig = (tuple((g["cwd"], g["mt"], len(g["runs"])) for g in items),
+               tuple(sorted(k for k, v in self._open.items() if v)))
+        if sig == self._sig: return False      # nothing changed → no rebuild, no flicker
+        self._sig = sig; self._last_items = items
+        for c in self.list.get_children(): self.list.remove(c)
+        if not items:
+            self.foot.set_text("no sessions yet"); self.list.show_all()
+            schedule_relayout(); return False
+        now = time.time()
+        total = sum(len(g["runs"]) for g in items)
+        for i, g in enumerate(items):
+            self.list.pack_start(self._group_row(g, i == 0, now), False, False, 0)
+            if self._open.get(g["cwd"]):       # unfolded → older runs underneath
+                for e in g["runs"][1:]:
+                    self.list.pack_start(self._child_row(e, now), False, False, 0)
+        self.foot.set_text("%d projects · %d runs · latest %s"
+                           % (len(items), total, self._ago(now - items[0]["mt"])))
+        self.list.show_all()
+        schedule_relayout()                    # height changed → restack the pane
+        return False
+
+    @staticmethod
+    def _ago(sec):
+        sec = max(0, int(sec))
+        if sec < 60:    return "just now"
+        if sec < 3600:  return "%dm ago" % (sec // 60)
+        if sec < 86400: return "%dh ago" % (sec // 3600)
+        return "%dd ago" % (sec // 86400)
+
+    def _group_row(self, g, first, now):
+        """One project. Clicking resumes its newest run; the count unfolds the rest."""
+        cwd, runs = g["cwd"], g["runs"]
+        e = runs[0]; name = self._label(cwd)
+        row = Gtk.Box(spacing=0)
+
+        btn = Gtk.Button(); btn.get_style_context().add_class("srow")
+        btn.set_relief(Gtk.ReliefStyle.NONE); btn.set_hexpand(True)
+        line = Gtk.Box(spacing=8)
+        rail = L("●" if first else "│", "srail live" if first else "srail")
+        rail.set_valign(Gtk.Align.START)
+        line.pack_start(rail, False, False, 0)
+
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        top = Gtk.Box(spacing=8)
+        d = L(name.upper()[:26], "sdir"); d.set_xalign(0); d.set_hexpand(True)
+        d.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        ago = L(self._ago(now - e["mt"]), "stime"); ago.set_xalign(1)
+        top.pack_start(d, True, True, 0); top.pack_end(ago, False, False, 0)
+        col.pack_start(top, False, False, 0)
+        tl = L(e.get("task") or "—", "stask"); tl.set_xalign(0)
+        tl.set_ellipsize(Pango.EllipsizeMode.END); tl.set_max_width_chars(40)
+        col.pack_start(tl, False, False, 0)
+        line.pack_start(col, True, True, 0)
+        btn.add(line)
+        btn.set_tooltip_text("%s\n%s\nclaude --resume %s" % (cwd, e.get("task") or "", e["sid"]))
+        btn.connect("clicked", lambda *_: self._resume(cwd, e["sid"]))
+        btn.connect("button-press-event", self._menu, cwd, e["sid"], name)
+        row.pack_start(btn, True, True, 0)
+
+        if len(runs) > 1:
+            opened = self._open.get(cwd, False)
+            tog = Gtk.Button(label="%d %s" % (len(runs), "⌄" if opened else "›"))
+            tog.get_style_context().add_class("scount")
+            tog.set_relief(Gtk.ReliefStyle.NONE); tog.set_valign(Gtk.Align.CENTER)
+            tog.set_tooltip_text("%d runs in %s" % (len(runs), name))
+            tog.connect("clicked", self._toggle_group, cwd)
+            row.pack_end(tog, False, False, 0)
+        return row
+
+    def _child_row(self, e, now):
+        """An older run inside an unfolded project."""
+        cwd = e.get("cwd") or os.path.expanduser("~")
+        btn = Gtk.Button(); btn.get_style_context().add_class("srow child")
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        line = Gtk.Box(spacing=8)
+        line.pack_start(L("╰", "srail"), False, False, 0)
+        t = L(time.strftime("%d %b %H:%M", time.localtime(e["mt"])), "stime")
+        t.set_xalign(0); t.set_size_request(78, -1)
+        line.pack_start(t, False, False, 0)
+        tl = L(e.get("task") or "—", "stask"); tl.set_xalign(0); tl.set_hexpand(True)
+        tl.set_ellipsize(Pango.EllipsizeMode.END); tl.set_max_width_chars(30)
+        line.pack_start(tl, True, True, 0)
+        btn.add(line)
+        btn.set_tooltip_text("%s\n%s\nclaude --resume %s" % (cwd, e.get("task") or "", e["sid"]))
+        btn.connect("clicked", lambda *_: self._resume(cwd, e["sid"]))
+        btn.connect("button-press-event", self._menu, cwd, e["sid"], self._label(cwd))
+        return btn
+
+    def _toggle_group(self, btn, cwd):
+        self._open[cwd] = not self._open.get(cwd, False)
+        self._sig = None                 # force a rebuild
+        self._render(self._last_items)
+        return True
+
+    def _resume(self, cwd, sid):
+        sh("gnome-terminal --working-directory=%s -- claude --resume %s"
+           % (shlex.quote(cwd), shlex.quote(sid)))
+
+    def _menu(self, btn, ev, cwd, sid, name):
+        if ev.button != 3: return False
+        m = Gtk.Menu()
+        hdr = Gtk.MenuItem(label=name); hdr.set_sensitive(False)
+        m.append(hdr); m.append(Gtk.SeparatorMenuItem())
+        q = shlex.quote(cwd)
+        for text, cmd in (
+                ("Resume this session", "gnome-terminal --working-directory=%s -- claude --resume %s" % (q, shlex.quote(sid))),
+                ("Continue latest here", "gnome-terminal --working-directory=%s -- claude -c" % q),
+                ("Open terminal here",   "gnome-terminal --working-directory=%s" % q),
+                ("Open in Files",        "nemo %s" % q)):
+            mi = Gtk.MenuItem(label=text)
+            mi.connect("activate", lambda w, c=cmd: sh(c)); m.append(mi)
+        m.show_all(); m.popup_at_pointer(ev)
+        return True
 
 # ---------- NOTES (editable, autosaved) ----------
 class Notes(Widget):
     FILE = os.path.join(CONF_DIR, "notes.txt")
     def __init__(self):
         super().__init__("notes", 1130, 762, 710, focusable=True)
-        b = vbox(8, m=22); b.pack_start(self.header("NOTES"), False, False, 0)
+        b = vbox(7, m=22); b.pack_start(self.header("NOTES", collapsible=True), False, False, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.buf = Gtk.TextBuffer()
         try: self.buf.set_text(open(self.FILE).read())
         except Exception: pass
@@ -838,11 +1299,13 @@ class Notes(Widget):
         tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         sc = Gtk.ScrolledWindow()
         sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)  # vertical scroll
-        sc.set_size_request(-1, 108); sc.get_style_context().add_class("notes")
+        sc.set_size_request(-1, 230); sc.get_style_context().add_class("notes")
         sc.add(tv)
-        b.pack_start(sc, True, True, 0)
+        body.pack_start(sc, True, True, 0)
+        b.pack_start(body, True, True, 0)
         self.add(b)
         self.buf.connect("changed", self._save)
+        self.setup_collapse(body)
     def _save(self, *_):
         s, e = self.buf.get_bounds()
         try: open(self.FILE, "w").write(self.buf.get_text(s, e, True))
@@ -862,16 +1325,20 @@ class Assistant(Widget):
     def __init__(self):
         super().__init__("assistant", 690, 300, 440, focusable=True)
         self.busy = False; self.history = []; self.model = self.MODELS[0]
-        b = vbox(8, m=18)
+        b = vbox(7, m=18)
         head = Gtk.Box(spacing=6)
         self.titlelbl = L("JARVIS", "title"); self.titlelbl.set_hexpand(True); self.titlelbl.set_xalign(0)
         self.mbtn = Gtk.Button(label="qwen2.5-coder:3b"); self.mbtn.get_style_context().add_class("chatq")
         self.mbtn.set_relief(Gtk.ReliefStyle.NONE); self.mbtn.connect("clicked", self._cycle_model)
         clr = Gtk.Button(label="CLEAR"); clr.get_style_context().add_class("media")
         clr.set_relief(Gtk.ReliefStyle.NONE); clr.connect("clicked", self._clear)
+        shut = Gtk.Button(label="✕"); shut.get_style_context().add_class("media")
+        shut.set_relief(Gtk.ReliefStyle.NONE)
+        shut.connect("clicked", lambda *_: self.hide_popup())
         dot = L("●", "hdot"); HDOTS.append(dot)
         head.pack_start(self.titlelbl, True, True, 0)
-        head.pack_end(dot, False, False, 0); head.pack_end(clr, False, False, 0)
+        head.pack_end(dot, False, False, 0); head.pack_end(shut, False, False, 0)
+        head.pack_end(clr, False, False, 0)
         head.pack_end(self.mbtn, False, False, 0)
         b.pack_start(head, False, False, 0)
         # compact live model-status line (folded in from the old Local Model card)
@@ -889,7 +1356,7 @@ class Assistant(Widget):
         self.tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR); self.tv.set_editable(False)
         self.tv.set_cursor_visible(False)
         self.sc = Gtk.ScrolledWindow(); self.sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.sc.set_size_request(-1, 150); self.sc.add(self.tv)
+        self.sc.set_size_request(-1, 230); self.sc.add(self.tv)
         b.pack_start(self.sc, True, True, 0)
         self._append("sys", "Ask me anything — runs on your local model, fully offline.\n")
         # input row
@@ -902,6 +1369,27 @@ class Assistant(Widget):
         row.pack_start(self.entry, True, True, 0); row.pack_end(send, False, False, 0)
         b.pack_start(row, False, False, 0)
         self.add(b)
+
+    # ---- popup control (driven by the floating orb) ----
+    def toggle_popup(self, orb):
+        if self.get_visible(): self.hide_popup()
+        else: self.show_popup(orb)
+
+    def show_popup(self, orb):
+        # sit just above the orb, clamped to the screen
+        ox, oy = orb.get_position()
+        h = self.get_preferred_height()[1] or 380
+        geo = (Gdk.Display.get_default().get_primary_monitor()
+               or Gdk.Display.get_default().get_monitor(0)).get_geometry()
+        self.move(ox, max(geo.y + 20, oy - h - 12))
+        self.set_keep_below(False); self.set_keep_above(True)   # float over other cards
+        self.show_all()
+        self.present()
+        GLib.idle_add(self.entry.grab_focus)
+
+    def hide_popup(self):
+        self.set_keep_above(False); self.set_keep_below(True)
+        self.hide()
 
     def _append(self, tag, text):
         end = self.buf.get_end_iter()
@@ -1015,6 +1503,200 @@ class Assistant(Widget):
                 "- Uptime: %s\n- Network: Wi-Fi '%s', local IP %s\n- Date/time: %s"
                 % (host, distro, cpu, load, temp, ram_used, ram_tot, bat, chg, disk, up, ssid, ip, now))
 
+# ---------- PALETTE (live theme switcher) ----------
+class Palette(Widget):
+    def __init__(self):
+        super().__init__("palette", 74, 300, 300)
+        b = vbox(7, m=18); b.pack_start(self.header("PALETTE"), False, False, 0)
+        self.name = L(THEME_NAME, "swname"); self.name.set_xalign(0)
+        b.pack_start(self.name, False, False, 0)
+        grid = Gtk.Box(spacing=6)
+        self.sw = {}
+        for n in THEME_NAMES:
+            t = THEMES[n]
+            btn = Gtk.Button(); btn.get_style_context().add_class("swatch")
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_size_request(46, 34); btn.set_tooltip_text(n)
+            da = Gtk.DrawingArea()
+            da.connect("draw", self._paint, t)
+            btn.add(da)
+            btn.connect("clicked", lambda w, nn=n: self._pick(nn))
+            self.sw[n] = btn; grid.pack_start(btn, True, True, 0)
+        b.pack_start(grid, False, False, 0)
+        self.add(b)
+        self._mark()
+
+    def _paint(self, da, cr, t):
+        w = da.get_allocated_width(); h = da.get_allocated_height()
+        cr.set_source_rgb(*rgb(t["tile"])); cr.rectangle(0, 0, w, h); cr.fill()
+        cr.set_source_rgb(*rgb(t["accent"])); cr.rectangle(0, 0, w, h * 0.42); cr.fill()
+        cr.set_source_rgb(*rgb(t["text"]))
+        cr.rectangle(3, h * 0.60, w * 0.55, 2); cr.fill()
+        cr.set_source_rgb(*rgb(t["dim"]))
+        cr.rectangle(3, h * 0.76, w * 0.34, 2); cr.fill()
+        return False
+
+    def _pick(self, name):
+        set_theme(name); self.name.set_text(name); self._mark()
+
+    def _mark(self):
+        for n, btn in self.sw.items():
+            ctx = btn.get_style_context()
+            (ctx.add_class if n == THEME_NAME else ctx.remove_class)("on")
+
+# ---------- RAIL (slim strip; expands the cards that aren't in the pane) ----------
+class Rail(Widget):
+    """A thin vertical launcher on the left edge. Each icon shows/hides its card
+    with a short slide+fade, so the extra widgets stay one click away."""
+    ICONS = {"controls": "◉", "pomo": "◔", "calendar": "▦",
+             "notes": "✎", "arcade": "◈", "palette": "◐"}
+    LABELS = {"controls": "CTRL", "pomo": "FOCUS", "calendar": "CAL",
+              "notes": "NOTE", "arcade": "PLAY", "palette": "SKIN"}
+
+    def __init__(self, targets):
+        super().__init__("rail", 8, 300)
+        self.targets = targets            # wname -> Widget (hidden pop-outs)
+        self.btns = {}; self.tags = {}
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        col.get_style_context().add_class("railbar")
+        for n in list(self.ICONS):
+            if n not in targets: continue
+            cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            btn = Gtk.Button(label=self.ICONS[n])
+            btn.get_style_context().add_class("railbtn")
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_tooltip_text(self.LABELS[n])
+            btn.connect("clicked", lambda w, nn=n: self.toggle(nn))
+            cell.pack_start(btn, False, False, 0)
+            tag = L(self.LABELS[n], "railtag", 0.5)
+            cell.pack_start(tag, False, False, 0)
+            self.btns[n] = btn
+            self.tags[n] = tag
+            col.pack_start(cell, False, False, 0)
+        self.add(col)
+        GLib.idle_add(self._centre)
+        GLib.timeout_add(1000, self._tick)
+
+    def _tick(self):
+        # the Focus timer auto-starts at login and lives behind an icon, so surface
+        # its countdown on the rail instead of making you open it to check.
+        p = self.targets.get("pomo")
+        tag = self.tags.get("pomo")
+        if p is not None and tag is not None:
+            if getattr(p, "running", False):
+                m, s = divmod(p.remaining, 60)
+                tag.set_text("%d:%02d" % (m, s))
+                self.btns["pomo"].get_style_context().add_class("on")
+            else:
+                tag.set_text(self.LABELS["pomo"])
+                if not p.get_visible():
+                    self.btns["pomo"].get_style_context().remove_class("on")
+        return True
+
+    def add(self, widget):     # the rail draws its own pill, not a .card
+        self._cardbox = widget
+        Gtk.Window.add(self, widget)
+
+    def _centre(self):
+        geo = (Gdk.Display.get_default().get_primary_monitor()
+               or Gdk.Display.get_default().get_monitor(0)).get_geometry()
+        h = self.get_preferred_height()[1]
+        self.move(8, geo.y + max(0, (geo.height - h) // 2))
+        return False
+
+    def toggle(self, name):
+        w = self.targets.get(name)
+        if w is None: return
+        if w.get_visible():
+            self._slide_out(w, name); return
+        # only one pop-out at a time — close whatever else is open first
+        for other, ow in self.targets.items():
+            if other != name and ow.get_visible():
+                self._slide_out(ow, other)
+        self._slide_in(w, name)
+
+    def _anchor(self, w):
+        """Open in the empty space to the RIGHT of the pane: never covers a pane
+        card, and it balances a desktop that otherwise sits entirely on the left."""
+        h = w.get_preferred_height()[1] or 200
+        geo = (Gdk.Display.get_default().get_primary_monitor()
+               or Gdk.Display.get_default().get_monitor(0)).get_geometry()
+        x = PANE_X + PANE_W + 26
+        y = geo.y + max(12, (geo.height - h) // 2)      # vertically centred
+        return x, y
+
+    def _raise(self, w):
+        # every widget is keep_below, so a pop-out would surface *under* the pane
+        # cards. Lift it out of that layer while it is open.
+        w.set_keep_below(False); w.set_keep_above(True)
+        gw = w.get_window()
+        if gw is not None: gw.raise_()
+
+    def _slide_in(self, w, name):
+        x, y = self._anchor(w)
+        w.set_opacity(0.0)
+        w.move(x - 22, y)
+        w.show_all()
+        self._raise(w)
+        self.btns[name].get_style_context().add_class("on")
+        self._animate(w, x - 22, x, y, 0.0, 1.0)
+
+    def _slide_out(self, w, name):
+        x, y = w.get_position()
+        self.btns[name].get_style_context().remove_class("on")
+        w.set_keep_above(False); w.set_keep_below(True)
+        self._animate(w, x, x - 22, y, 1.0, 0.0, hide=w)
+
+    def _animate(self, w, x0, x1, y, o0, o1, hide=None, steps=10):
+        state = {"i": 0}
+        def step():
+            state["i"] += 1
+            f = state["i"] / steps
+            e = 1 - (1 - f) ** 3          # ease-out
+            w.move(int(x0 + (x1 - x0) * e), y)
+            w.set_opacity(o0 + (o1 - o0) * e)
+            if state["i"] >= steps:
+                if hide is not None: hide.hide(); hide.set_opacity(1.0)
+                return False
+            return True
+        GLib.timeout_add(16, step)
+
+# ---------- JARVIS ORB (floating launcher for the Assistant) ----------
+class AssistantOrb(Widget):
+    """Small breathing puck in the bottom-left corner. Click to pop the chat
+    open above it; click again (or CLOSE in the chat) to tuck it away."""
+    SIZE = 52
+
+    def __init__(self, assistant):
+        super().__init__("orb", 50, 1000)
+        self.assistant = assistant
+        self._t0 = time.time()
+        btn = Gtk.Button(); btn.get_style_context().add_class("orb")
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.set_size_request(self.SIZE, self.SIZE)
+        self.icon = L("◕", "orbicon", 0.5)
+        btn.add(self.icon)
+        btn.connect("clicked", lambda *_: self.assistant.toggle_popup(self))
+        self.btn = btn
+        self.add(btn)
+        GLib.timeout_add(70, self._breathe)
+
+    def add(self, widget):   # no .card class here — the orb styles itself
+        self._cardbox = widget
+        Gtk.Window.add(self, widget)
+
+    def _breathe(self):
+        # idle: slow pulse. thinking: faster, with a spinning glyph.
+        busy = getattr(self.assistant, "busy", False)
+        speed = 6.0 if busy else 1.8
+        a = 0.55 + 0.45 * (0.5 + 0.5 * math.sin((time.time() - self._t0) * speed))
+        self.icon.set_opacity(a)
+        if busy:
+            self.icon.set_text("◐◓◑◒"[int((time.time() - self._t0) * 7) % 4])
+        else:
+            self.icon.set_text("◕" if self.assistant.get_visible() else "◔")
+        return True
+
 # ---------- ARCADE (switchable mini-games) ----------
 class Arcade(Widget):
     GAMES = ["DASH", "HOOPS", "SNAKE", "REFLEX", "RAIN"]
@@ -1025,15 +1707,20 @@ class Arcade(Widget):
     HOOPS_G = 1300.0           # gravity px/s²
     W, H = 404, 236
     COLS, ROWS, CELL = 25, 14, 16
-    R = (0.843, 0.098, 0.129)   # accent
+    @property
+    def R(self): return rgb(ACCENT)   # accent, follows the live theme
     SNAKE_STEP = 0.11           # seconds per snake cell (frame-rate independent)
     FPS_MS = 22                 # ~45 fps timer; physics is dt-scaled so speed is constant
 
     def __init__(self):
         super().__init__("arcade", 690, 610, 440, focusable=True)
         self.gi = 0; self._last_t = time.monotonic(); self.sn_acc = 0.0
-        b = vbox(8, m=18)
+        b = vbox(7, m=18)
         head = Gtk.Box(spacing=6)
+        self._caret = Gtk.Button(label="▾"); self._caret.get_style_context().add_class("caret")
+        self._caret.set_relief(Gtk.ReliefStyle.NONE)
+        self._caret.connect("clicked", lambda *_: self.toggle_collapse())
+        head.pack_start(self._caret, False, False, 0)
         self.titlelbl = L("ARCADE · DASH", "title"); self.titlelbl.set_hexpand(True); self.titlelbl.set_xalign(0)
         prev = Gtk.Button(label="‹"); nxt = Gtk.Button(label="›")
         for btn, d in ((prev, -1), (nxt, 1)):
@@ -1043,6 +1730,7 @@ class Arcade(Widget):
         head.pack_start(self.titlelbl, True, True, 0)
         head.pack_end(dot, False, False, 0); head.pack_end(nxt, False, False, 0); head.pack_end(prev, False, False, 0)
         b.pack_start(head, False, False, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.da = Gtk.DrawingArea(); self.da.set_size_request(self.W, self.H); self.da.set_can_focus(True)
         self.da.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.KEY_PRESS_MASK
                            | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.BUTTON1_MOTION_MASK)
@@ -1051,12 +1739,18 @@ class Arcade(Widget):
         self.da.connect("button-release-event", self._da_release)
         self.da.connect("motion-notify-event", self._da_motion)
         self.da.connect("key-press-event", self._key)
-        b.pack_start(self.da, False, False, 0)
+        body.pack_start(self.da, False, False, 0)
         self.hint = L(self.HINTS["DASH"], "faint"); self.hint.set_xalign(0)
-        b.pack_start(self.hint, False, False, 0)
+        body.pack_start(self.hint, False, False, 0)
+        b.pack_start(body, False, False, 0)
         self.add(b)
         for n in self.GAMES: self._reset_game(n)
         GLib.timeout_add(self.FPS_MS, self._loop)
+        self.setup_collapse(body)
+
+    def on_collapse(self, collapsed):
+        # a hidden game must not keep burning ~45 redraws/second
+        if not collapsed: self._last_t = time.monotonic()
 
     def switch(self, d):
         self.gi = (self.gi + d) % len(self.GAMES)
@@ -1113,6 +1807,9 @@ class Arcade(Widget):
         return False
 
     def _loop(self):
+        if self._collapsed or not self.get_visible():
+            self._last_t = time.monotonic()   # don't bank up dt while hidden/folded
+            return True
         now = time.monotonic()
         dt = now - self._last_t; self._last_t = now
         if dt > 0.1: dt = 0.1          # clamp after stalls so nothing teleports
@@ -1322,11 +2019,23 @@ class Arcade(Widget):
 # ---------- main ----------
 def main():
     apply_css()
-    widgets = [Clock(), Controls(), System(), Network(), NowPlaying(),
-               Status(), Calendar(), Pomodoro(), Notes(), Arcade(),
-               Assistant(), Launcher()]
-    for w in widgets: w.show_all()
+    assistant = Assistant()               # hidden; opened by the orb
+    # --- rail pop-outs: built now, shown only when their icon is clicked ---
+    rail_targets = {"controls": Controls(), "pomo": Pomodoro(), "calendar": Calendar(),
+                    "notes": Notes(), "arcade": Arcade(), "palette": Palette()}
+    for _n, _w in rail_targets.items():
+        _w.set_size_request(NOTES_W if _n == "notes" else POPOUT_W, -1)
+    # --- the pane: the five cards worth seeing at a glance ---
+    pane = [Clock(), System(), Status(), Network(), NowPlaying(), Sessions()]
+    chrome = [Rail(rail_targets), AssistantOrb(assistant), Launcher()]
+    for w in pane + chrome: w.show_all()
     start_pulse()
+    GLib.idle_add(relayout_pane)          # stack the column once real sizes are known
+    GLib.timeout_add(400, relayout_pane)
+    # Muffin nudges sticky windows out of place when you switch workspaces. A
+    # light heartbeat re-asserts the stack; relayout_pane() moves only cards that
+    # have actually drifted, so this is nearly free when nothing changed.
+    GLib.timeout_add(1200, pane_keeper)
     Gtk.main()
 
 if __name__ == "__main__":
