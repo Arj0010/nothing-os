@@ -333,6 +333,16 @@ class Widget(Gtk.Window):
         # taskbar. accept_focus=False already stops clicks stealing focus — DOCK
         # would block dragging entirely (WMs treat docks as fixed panel furniture).
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        # ...but a UTILITY window with no WM_TRANSIENT_FOR is subject to Muffin's
+        # "promotion due to group": it inherits the highest layer of ANY window in
+        # its WM_HINTS group (mutter stack.c: compute_layer ->
+        # get_maximum_layer_in_group). GTK gives every window of a process the same
+        # group leader, so ONE keep_above window — a rail pop-out, the assistant,
+        # the REPOS dialog — used to drag the entire desktop into META_LAYER_TOP,
+        # covering the user's real windows and making them unclickable.
+        # Making each window its own group leader isolates them, so a widget can
+        # never be promoted by one of its siblings.
+        self.connect("realize", self._isolate_wm_group)
         self.set_app_paintable(True)
         vis = self.get_screen().get_rgba_visual()
         if vis: self.set_visual(vis)
@@ -363,6 +373,13 @@ class Widget(Gtk.Window):
         self.connect("configure-event", self._configure)
         self.connect("enter-notify-event", self._enter)
         self.connect("leave-notify-event", self._leave)
+
+    def _isolate_wm_group(self, *_):
+        # own group leader == no shared group == no cross-widget layer promotion
+        gw = self.get_window()
+        if gw is not None:
+            try: gw.set_group(gw)
+            except Exception: pass
 
     action = None   # double-click a card to launch this
 
@@ -1382,13 +1399,15 @@ class Assistant(Widget):
         geo = (Gdk.Display.get_default().get_primary_monitor()
                or Gdk.Display.get_default().get_monitor(0)).get_geometry()
         self.move(ox, max(geo.y + 20, oy - h - 12))
-        self.set_keep_below(False); self.set_keep_above(True)   # float over other cards
         self.show_all()
+        # Float over the other CARDS, not over the user's windows: stay in the
+        # keep_below layer and just restack within it. keep_above would put the
+        # chat in META_LAYER_TOP, covering whatever the user is working in.
+        # present() only raises/activates — it does not change the layer.
         self.present()
         GLib.idle_add(self.entry.grab_focus)
 
     def hide_popup(self):
-        self.set_keep_above(False); self.set_keep_below(True)
         self.hide()
 
     def _append(self, tag, text):
@@ -1626,9 +1645,11 @@ class Rail(Widget):
         return x, y
 
     def _raise(self, w):
-        # every widget is keep_below, so a pop-out would surface *under* the pane
-        # cards. Lift it out of that layer while it is open.
-        w.set_keep_below(False); w.set_keep_above(True)
+        # A pop-out must clear the pane cards — but only them. Restack INSIDE the
+        # keep_below layer: raising is honoured within a layer, so the pop-out
+        # lands on top of the other widgets while the user's windows stay on top
+        # of everything. keep_above here used to lift the pop-out into
+        # META_LAYER_TOP and (via group promotion) the whole desktop with it.
         gw = w.get_window()
         if gw is not None: gw.raise_()
 
@@ -1644,7 +1665,6 @@ class Rail(Widget):
     def _slide_out(self, w, name):
         x, y = w.get_position()
         self.btns[name].get_style_context().remove_class("on")
-        w.set_keep_above(False); w.set_keep_below(True)
         self._animate(w, x, x - 22, y, 1.0, 0.0, hide=w)
 
     def _animate(self, w, x0, x1, y, o0, o1, hide=None, steps=10):
