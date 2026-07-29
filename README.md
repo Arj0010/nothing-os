@@ -25,6 +25,7 @@ draggable GTK3 widgets over a live Conky background, in a dark **dot-matrix + re
 | **Local Model** | live Ollama status (model · params · size · CPU/GPU) + iGPU freq |
 | **Notes** | editable, autosaved to `notes.txt` |
 | **Arcade** | switchable mini-games: DASH · SNAKE · REFLEX · RAIN |
+| **Clean** | reclaimable-space scan, one-touch cache clean, 7-day memory timeline |
 | **Dock** | macOS-style live dock — open apps + pins, click to focus/launch |
 
 **Background** — `conky/bg.lua` + `bg.conf`: CPU-reactive dotted rings, a drifting
@@ -95,10 +96,40 @@ Autostart (`nothing-conky.desktop`, installed in step 2) relaunches everything
 ~6s after each login. Optional keybindings (Alt+Space, Ctrl+Esc, …) are set
 through **Cinnamon ▸ Keyboard ▸ Shortcuts** — see the table above.
 
+## CLEAN :// widget
+
+Opens from the rail (`◌`). Sizes every cache it knows about, and `CLEAN NOW`
+empties the safe ones in one tap. The rail icon shows the reclaimable total, so
+you can tell there's something to clean without opening the card.
+
+- **Held targets** (`~/.cache/puppeteer`, `~/.cache/uv`) are sized and shown but
+  never auto-cleaned — deleting them costs a ~600 MB re-download or slow rebuilds.
+  Each has its own `×`.
+- **Every deletion is path-guarded** to `~/.cache` and `~/.local/share/Trash`;
+  contents go, the directory stays, and symlinks pointing outside are unlinked
+  rather than followed. The logic lives in `nothing-widgets/cleaner_core.py` with
+  tests in `test_cleaner_core.py` (`python3 nothing-widgets/test_cleaner_core.py`).
+- **Apps come back.** `~/.cache/vicinae` is cleared with `vicinae.service` stopped
+  around it; anything else watched (conky) that dies during a clean is relaunched,
+  and the card reports `RESTARTED …`.
+- **The memory timeline** samples top processes every 30 s to a 7-day rolling log,
+  showing per-app peak RSS. `KILL` sends `SIGTERM` only and asks `SURE?` first.
+- **No `drop_caches`.** It would discard useful page cache and make the machine
+  slower, not faster.
+
+The two root-owned targets (apt cache, journal) need a pinned sudoers rule:
+
+```bash
+./install.sh --with-cleaner-sudo     # validates with visudo before installing
+```
+
+Without it those rows read `AUTH` and `CLEAN NOW` skips them — nothing hangs.
+
 ## Backup workflow
 
 Live files are edited under `~/.config`; `./sync.sh` copies them back here, then
-commit + push. Runtime state (`positions.json`, `notes.txt`) is git-ignored.
+commit + push. Runtime state (`positions.json`, `notes.txt`,
+`cleaner-history.jsonl`) is git-ignored.
 
 ## Requirements
 

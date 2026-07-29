@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 nothing-widgets/positions.json
 nothing-widgets/notes.txt
+nothing-widgets/cleaner-history.jsonl
 # genwall.py retints the wallpaper on every theme change and leaves timestamped
 # copies behind; only the committed conky/wallpaper.png is the real asset.
 conky/wallpaper-*.png

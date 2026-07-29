@@ -126,7 +126,7 @@ POPOUT_W = 460          # every rail pop-out shares this width
 NOTES_W  = 560          # Notes gets extra room to actually read/write
 PANE_ORDER = ["clock", "system", "status", "net", "now", "sessions"]
 # Everything else is reachable from the RAIL: a slim icon strip on the left edge.
-RAIL_ORDER = ["controls", "pomo", "calendar", "notes", "arcade"]
+RAIL_ORDER = ["controls", "pomo", "calendar", "notes", "arcade", "palette", "clean"]
 PANE = {}          # wname -> Widget, filled as they are constructed
 
 def relayout_pane():
@@ -527,6 +527,11 @@ def vbox(spacing=6, m=0):
     b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
     b.get_style_context().add_class("card")
     return b
+
+def vbox_plain(spacing=6):
+    # unstyled column for grouping rows INSIDE a card — a nested .card would draw a
+    # second border and background over the first
+    return Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
 
 # ---------- CLOCK ----------
 class Clock(Widget):
@@ -1563,14 +1568,267 @@ class Palette(Widget):
             ctx = btn.get_style_context()
             (ctx.add_class if n == THEME_NAME else ctx.remove_class)("on")
 
+# ---------- CLEAN :// (cache reclaim + memory timeline) ----------
+try:
+    import cleaner_core
+except Exception:      # the card degrades to a notice rather than killing the desktop
+    cleaner_core = None
+
+def hsize(n):
+    """human() with one decimal at GB. '1.5G' vs '1G' is the difference between
+    bothering to clean and not."""
+    n = float(max(0, n))
+    if n < 1024: return "%dB" % n
+    n /= 1024
+    if n < 1024: return "%.0fK" % n
+    n /= 1024
+    if n < 1024: return "%.0fM" % n
+    return "%.1fG" % (n / 1024)
+
+class Cleaner(Widget):
+    """CLEAN :// — one-touch cache reclaim plus a 7-day memory timeline.
+
+    Scanning and cleaning both run off-thread: du over ~2 GB of caches, a journal
+    vacuum and a service restart would otherwise freeze every widget in the process.
+    The scan keeps running while the card is hidden so the rail can show the total.
+    """
+    SHOWN     = 6        # target rows before the remainder collapses into OTHER
+    RESCAN_MS = 60000
+    SAMPLE_MS = 30000
+
+    def __init__(self):
+        super().__init__("clean", 735, 40, POPOUT_W)
+        self.action = "gnome-system-monitor"
+        self.scan_rows = []
+        self.reclaim = 0          # read by the rail to label its icon
+        self.busy = False
+        self.hist = cleaner_core.History() if cleaner_core else None
+
+        b = vbox(7, m=22)
+        self.tag = L("", "dim")
+        b.pack_start(self.header("CLEAN ://", subtitle=self.tag), False, False, 0)
+
+        self.total = L("—", "clock2"); self.total.set_xalign(0)
+        b.pack_start(self.total, False, False, 0)
+        cap = L("RECLAIMABLE", "faint"); b.pack_start(cap, False, False, 0)
+
+        self.btn = Gtk.Button(label="CLEAN NOW")
+        self.btn.get_style_context().add_class("tile")
+        self.btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.btn.set_size_request(-1, 38)
+        self.btn.connect("clicked", self._clean_now)
+        b.pack_start(self.btn, False, False, 0)
+
+        self.status = L("SCANNING", "faint"); b.pack_start(self.status, False, False, 0)
+
+        b.pack_start(rule(), False, False, 0)
+        self.tbox = vbox_plain(3); b.pack_start(self.tbox, False, False, 0)
+
+        self.heldlbl = L("HELD · not auto-cleaned", "faint")
+        b.pack_start(rule(), False, False, 0)
+        b.pack_start(self.heldlbl, False, False, 0)
+        self.hbox = vbox_plain(3); b.pack_start(self.hbox, False, False, 0)
+
+        b.pack_start(rule(), False, False, 0)
+        b.pack_start(L("MEMORY · 7d", "faint"), False, False, 0)
+        self.mbox = vbox_plain(3); b.pack_start(self.mbox, False, False, 0)
+
+        self.add(b)
+        if cleaner_core is None:
+            self.status.set_text("cleaner_core.py MISSING")
+            return
+        self.first(self._scan_async)
+        self.first(self._sample)
+        GLib.timeout_add(self.RESCAN_MS, self._scan_async)
+        GLib.timeout_add(self.SAMPLE_MS, self._sample)
+
+    # ---- arming: a stray click must never delete a cache or kill an app ----
+    def _confirm(self, btn, label, action):
+        """First click arms the button (SURE? for 3 s); a second click inside that
+        window commits. Anything else disarms it."""
+        if getattr(btn, "_arm_id", None):
+            GLib.source_remove(btn._arm_id); btn._arm_id = None
+            btn.set_label(label); btn.get_style_context().remove_class("on")
+            action(); return
+        btn.set_label("SURE?"); btn.get_style_context().add_class("on")
+        def disarm():
+            btn._arm_id = None
+            btn.set_label(label); btn.get_style_context().remove_class("on")
+            return False
+        btn._arm_id = GLib.timeout_add(3000, disarm)
+
+    # ---- scanning ----------------------------------------------------------
+    def _scan_async(self, *_):
+        if cleaner_core is None or self.busy: return True
+        self.busy = True
+        def work():
+            try: rows = cleaner_core.scan()
+            except Exception: rows = []
+            GLib.idle_add(self._scan_done, rows)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _scan_done(self, rows):
+        self.busy = False
+        self.scan_rows = rows
+        self.reclaim = cleaner_core.reclaimable(rows) if rows else 0
+        self._render()
+        return False
+
+    def _render(self):
+        rows = self.scan_rows
+        self.total.set_text(hsize(self.reclaim) if rows else "—")
+        self.tag.set_text(hsize(self.reclaim) if self.reclaim else "")
+        for box in (self.tbox, self.hbox):
+            for ch in box.get_children(): box.remove(ch)
+        auto = sorted([r for r in rows if not r["held"]],
+                      key=lambda r: -r["bytes"])
+        held = sorted([r for r in rows if r["held"]], key=lambda r: -r["bytes"])
+        ok = [r for r in auto if r["state"] == "ok" and r["bytes"] > 0]
+        # Scale the bars against the rows that actually draw one. Including the AUTH
+        # rows in the maximum flattens every cleanable row to a single dot.
+        mx = max([r["bytes"] for r in ok] or [1]) or 1
+        # Rows that cannot be cleaned are pinned in regardless of size. They sort to
+        # the bottom on bytes (they contribute 0 to the total), so ranking alone
+        # would hide the fact that ~2 GB is one install step from being reclaimable.
+        flagged = [r for r in auto if r["state"] != "ok"]
+        shown = ok[:self.SHOWN]
+        for r in shown:
+            self.tbox.pack_start(self._target_row(r, mx), False, False, 0)
+        rest = ok[self.SHOWN:]
+        if rest:
+            other = {"label": "OTHER · %d" % len(rest), "state": "ok",
+                     "bytes": sum(r["bytes"] for r in rest)}
+            self.tbox.pack_start(self._target_row(other, mx), False, False, 0)
+        for r in flagged:
+            self.tbox.pack_start(self._target_row(r, mx), False, False, 0)
+        locked = sum(r["bytes"] for r in flagged if r["state"] == "auth")
+        if locked and not self.busy:
+            self.status.set_text("%s LOCKED · install.sh --with-cleaner-sudo"
+                                 % hsize(locked))
+        for r in held:
+            self.hbox.pack_start(self._held_row(r), False, False, 0)
+        self.heldlbl.set_visible(bool(held))
+        self.tbox.show_all(); self.hbox.show_all()
+        schedule_relayout()
+
+    def _target_row(self, r, mx):
+        row = Gtk.Box(spacing=10)
+        k = L(r["label"], "k"); k.set_size_request(104, -1)
+        # An uncleanable row spends its meter column on the reason instead of a bar,
+        # so it still carries its size in the value column where the eye expects it.
+        flag = {"auth": "AUTH", "err": "ERR", "blocked": "BLOCKED"}.get(r["state"])
+        meter = L(flag or dots(r["bytes"] / mx * 100 if mx else 0, 10), "meter")
+        val = L(hsize(r["bytes"]), "dim"); val.set_xalign(1); val.set_size_request(58, -1)
+        row.pack_start(k, False, False, 0)
+        row.pack_start(meter, False, False, 0)
+        row.pack_end(val, False, False, 0)
+        return row
+
+    def _held_row(self, r):
+        row = Gtk.Box(spacing=10)
+        k = L(r["label"], "k"); k.set_size_request(104, -1)
+        val = L(hsize(r["bytes"]), "dim"); val.set_xalign(1)
+        btn = Gtk.Button(label="×")
+        btn.get_style_context().add_class("tile")
+        btn.set_relief(Gtk.ReliefStyle.NONE); btn.set_size_request(34, 24)
+        btn.connect("clicked", lambda w, key=r["key"]:
+                    self._confirm(w, "×", lambda: self._clean([key])))
+        row.pack_start(k, False, False, 0)
+        row.pack_start(val, True, True, 0)
+        row.pack_end(btn, False, False, 0)
+        return row
+
+    # ---- cleaning ----------------------------------------------------------
+    def _clean_now(self, *_):
+        if not self.scan_rows: return
+        self._clean(cleaner_core.auto_keys(self.scan_rows))
+
+    def _clean(self, keys):
+        if cleaner_core is None or self.busy or not keys: return
+        self.busy = True
+        self.btn.set_sensitive(False)
+        self.status.set_text("CLEANING")
+        def work():
+            # Snapshot first: a cache we clear may belong to a running app, and the
+            # user should get it back rather than discover it gone an hour later.
+            snap = cleaner_core.snapshot_watched()
+            try: results = cleaner_core.clean(keys)
+            except Exception: results = []
+            time.sleep(1.5)                     # let anything knocked over exit
+            try: back = cleaner_core.revive(snap)
+            except Exception: back = []
+            try: rows = cleaner_core.scan()
+            except Exception: rows = []
+            GLib.idle_add(self._clean_done, results, back, rows)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clean_done(self, results, back, rows):
+        self.busy = False
+        self.btn.set_sensitive(True)
+        freed = sum(r["freed"] for r in results)
+        msg = "FREED " + hsize(freed)
+        skipped = [r["key"].upper() for r in results if r["state"] != "ok"]
+        if back:    msg += " · RESTARTED " + ", ".join(back)
+        if skipped: msg += " · SKIPPED " + ",".join(skipped)
+        self.status.set_text(msg)
+        self._scan_done(rows)
+        return False
+
+    # ---- memory timeline ---------------------------------------------------
+    def _sample(self, *_):
+        if cleaner_core is None: return True
+        try:
+            live = cleaner_core.sample()
+            if self.hist: self.hist.append(live)
+        except Exception:
+            return True
+        if self.get_visible(): self._render_mem(live)
+        return True
+
+    def _render_mem(self, live):
+        try: series = self.hist.series(top_n=4) if self.hist else []
+        except Exception: series = []
+        if not series:      # first run — nothing recorded yet, show what's true now
+            series = [{"name": r["name"], "peak": r["rss"], "points": [r["rss"]],
+                       "pid": r["pid"]} for r in live[:4]]
+        for ch in self.mbox.get_children(): self.mbox.remove(ch)
+        for s in series:
+            self.mbox.pack_start(self._mem_row(s), False, False, 0)
+        self.mbox.show_all()
+
+    def _mem_row(self, s):
+        row = Gtk.Box(spacing=8)
+        k = L(s["name"][:12], "k"); k.set_size_request(96, -1)
+        sp = L(spark(s["points"], 0), "meter")
+        val = L(hsize(s["peak"]), "dim"); val.set_xalign(1); val.set_size_request(52, -1)
+        row.pack_start(k, False, False, 0)
+        row.pack_start(sp, True, True, 0)
+        row.pack_start(val, False, False, 0)
+        if s.get("pid"):
+            btn = Gtk.Button(label="KILL")
+            btn.get_style_context().add_class("tile")
+            btn.set_relief(Gtk.ReliefStyle.NONE); btn.set_size_request(52, 24)
+            btn.connect("clicked", lambda w, pid=s["pid"], nm=s["name"]:
+                        self._confirm(w, "KILL", lambda: self._kill(pid, nm)))
+            row.pack_end(btn, False, False, 0)
+        return row
+
+    def _kill(self, pid, name):
+        ok = cleaner_core.kill(pid)
+        self.status.set_text(("SIGTERM → %s" if ok else "COULD NOT SIGNAL %s") % name)
+
+    def on_collapse(self, collapsed):
+        if not collapsed: self._scan_async()
+
 # ---------- RAIL (slim strip; expands the cards that aren't in the pane) ----------
 class Rail(Widget):
     """A thin vertical launcher on the left edge. Each icon shows/hides its card
     with a short slide+fade, so the extra widgets stay one click away."""
     ICONS = {"controls": "◉", "pomo": "◔", "calendar": "▦",
-             "notes": "✎", "arcade": "◈", "palette": "◐"}
+             "notes": "✎", "arcade": "◈", "palette": "◐", "clean": "◌"}
     LABELS = {"controls": "CTRL", "pomo": "FOCUS", "calendar": "CAL",
-              "notes": "NOTE", "arcade": "PLAY", "palette": "SKIN"}
+              "notes": "NOTE", "arcade": "PLAY", "palette": "SKIN", "clean": "CLEAN"}
 
     def __init__(self, targets):
         super().__init__("rail", 8, 300)
@@ -1610,6 +1868,13 @@ class Rail(Widget):
                 tag.set_text(self.LABELS["pomo"])
                 if not p.get_visible():
                     self.btns["pomo"].get_style_context().remove_class("on")
+        # CLEAN keeps scanning while hidden, so the rail can answer "is there
+        # anything worth reclaiming?" without opening the card.
+        c = self.targets.get("clean")
+        tag = self.tags.get("clean")
+        if c is not None and tag is not None:
+            n = getattr(c, "reclaim", 0)
+            tag.set_text(hsize(n) if n else self.LABELS["clean"])
         return True
 
     def add(self, widget):     # the rail draws its own pill, not a .card
@@ -2368,7 +2633,8 @@ def main():
     assistant = Assistant()               # hidden; opened by the orb
     # --- rail pop-outs: built now, shown only when their icon is clicked ---
     rail_targets = {"controls": Controls(), "pomo": Pomodoro(), "calendar": Calendar(),
-                    "notes": Notes(), "arcade": Arcade(), "palette": Palette()}
+                    "notes": Notes(), "arcade": Arcade(), "palette": Palette(),
+                    "clean": Cleaner()}
     for _n, _w in rail_targets.items():
         _w.set_size_request(NOTES_W if _n == "notes" else POPOUT_W, -1)
     # --- the pane: the five cards worth seeing at a glance ---
