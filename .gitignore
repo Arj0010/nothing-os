@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 nothing-widgets/positions.json
 nothing-widgets/notes.txt
+# genwall.py retints the wallpaper on every theme change and leaves timestamped
+# copies behind; only the committed conky/wallpaper.png is the real asset.
+conky/wallpaper-*.png
 
 # proprietary fonts — not redistributable in a public repo (obtain separately)
 fonts/Ndot*.otf

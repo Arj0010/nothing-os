@@ -2036,6 +2036,332 @@ class Arcade(Widget):
         cr.set_font_size(size); cr.set_source_rgba(*col, 1)
         ext = cr.text_extents(s); cr.move_to(x - ext.width * align, y + ext.height / 2); cr.show_text(s)
 
+# ---------- REPOS :// SYNC ----------
+# Panel for sync-repos.sh. The sweep itself runs on a systemd timer; this only
+# reads the JSON it leaves behind, so the desktop never blocks on git.
+REPO_CACHE   = os.path.expanduser("~/.cache/repo-sync")
+REPO_STATUS  = os.path.join(REPO_CACHE, "status.json")
+REPO_OFFLINE = os.path.join(REPO_CACHE, "offline")
+REPO_CONF_D  = os.path.expanduser("~/.config/repo-sync")
+REPO_CONF    = os.path.join(REPO_CONF_D, "config.json")
+SYNC_SCRIPT  = os.path.expanduser("~/projects/sync-repos.sh")
+REPO_ROOT0   = os.path.expanduser("~/projects")
+REPO_ROWS    = 8          # attention rows before the list collapses to "+N more"
+
+def repo_conf():
+    """{roots, disabled}; tolerant of a missing or hand-mangled config."""
+    try:
+        c = json.load(open(REPO_CONF))
+        if not isinstance(c, dict): raise ValueError
+    except Exception:
+        c = {}
+    roots = [r for r in (c.get("roots") or []) if isinstance(r, str)]
+    dis   = [d for d in (c.get("disabled") or []) if isinstance(d, str)]
+    return {"roots": roots or [REPO_ROOT0], "disabled": dis}
+
+def save_repo_conf(roots, disabled):
+    os.makedirs(REPO_CONF_D, exist_ok=True)
+    tmp = REPO_CONF + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"roots": roots, "disabled": sorted(set(disabled))}, f, indent=2)
+    os.replace(tmp, REPO_CONF)     # atomic — a sweep may be reading this right now
+
+def discover_repos(roots):
+    """[(path, root)] for every git repo under the roots. A root that is itself
+    a repo counts as one, matching sync-repos.sh so the UI can't disagree."""
+    found, seen = [], set()
+    for root in roots:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root): continue
+        if os.path.isdir(os.path.join(root, ".git")):
+            cand = [root]
+        else:
+            try: names = sorted(os.listdir(root), key=str.lower)
+            except OSError: continue
+            cand = [os.path.join(root, n) for n in names
+                    if os.path.isdir(os.path.join(root, n, ".git"))]
+        for p in cand:
+            if p not in seen:
+                seen.add(p); found.append((p, root))
+    return found
+
+def _mark(r):
+    """Right-hand status chip for one repo row, plus whether it needs attention."""
+    st, behind, dirty = r.get("state"), r.get("behind", 0), r.get("dirty_tracked", 0)
+    if st == "PULLED":      return "↓%d ✓" % behind, False
+    if st == "HELD":        return "↓%d ⚠%d" % (behind, dirty), True
+    if st == "ERROR":       return "ERR", True
+    if st == "LOCAL":       return "LOCAL", False
+    if st == "NO_UPSTREAM": return "NO UPSTREAM", False
+    return "", False
+
+class Repos(Widget):
+    def __init__(self):
+        super().__init__("repos", 1440, 40, 430)
+        gear = Gtk.Button(label="⚙")
+        gear.get_style_context().add_class("caret")
+        gear.set_relief(Gtk.ReliefStyle.NONE)
+        gear.set_tooltip_text("Choose which repos to sync")
+        gear.connect("clicked", self.open_settings)
+
+        b = vbox(6, m=22)
+        b.pack_start(self.header("REPOS :// SYNC", subtitle=gear), False, False, 0)
+        b.pack_start(rule(), False, False, 0)
+        self.summary = L("—", "v")
+        b.pack_start(self.summary, False, False, 0)
+        b.pack_start(rule(), False, False, 0)
+        self.rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        b.pack_start(self.rows, False, False, 0)
+        b.pack_start(rule(), False, False, 0)
+        self.foot = L("", "faint")
+        b.pack_start(self.foot, False, False, 0)
+        self.add(b)
+
+        self._win = None
+        self.first(self.refresh)
+        GLib.timeout_add(30000, self.refresh)
+
+    # ---- settings ----------------------------------------------------------
+    def open_settings(self, *_):
+        if self._win is not None:          # already open — just raise it
+            self._win.present(); return
+        self._win = ReposSettings(self)
+        self._win.connect("destroy", self._settings_closed)
+        self._win.show_all()
+
+    def _settings_closed(self, *_):
+        self._win = None
+        self.refresh()
+
+    def sync_now(self):
+        sh("%s --quiet" % shlex.quote(SYNC_SCRIPT))
+        # the sweep takes ~5s; look again a few times rather than guessing once
+        for delay in (6000, 12000, 25000):
+            GLib.timeout_add(delay, lambda: (self.refresh(), False)[1])
+
+    # ---- display -----------------------------------------------------------
+    def _row(self, r):
+        box = Gtk.Box(spacing=10)
+        name = L(r.get("name", "?")[:22], "v"); name.set_hexpand(True); name.set_xalign(0)
+        br = L((r.get("branch") or "")[:11], "faint")
+        text, hot = _mark(r)
+        chip = L(text, "dotlit" if hot else "faint")
+        box.pack_start(name, True, True, 0)
+        box.pack_start(br, False, False, 0)
+        box.pack_end(chip, False, False, 0)
+        return box
+
+    def refresh(self):
+        for ch in self.rows.get_children(): self.rows.remove(ch)
+        try:
+            st = json.load(open(REPO_STATUS))
+        except Exception:
+            self.summary.set_text("no sync data yet")
+            self.foot.set_text("run sync-repos.sh")
+            self.rows.show_all()
+            return True
+
+        t = st.get("totals", {})
+        self.summary.set_text("✓ %d   ↓ %d   ⚠ %d" % (
+            t.get("synced", 0), t.get("pulled", 0),
+            t.get("held", 0) + t.get("error", 0)))
+
+        att = [r for r in st.get("repos", []) if r.get("state") != "SYNCED"]
+        for r in att[:REPO_ROWS]:
+            self.rows.pack_start(self._row(r), False, False, 0)
+        if not att:
+            self.rows.pack_start(L("all clean", "faint"), False, False, 0)
+        elif len(att) > REPO_ROWS:
+            self.rows.pack_start(L("+%d more" % (len(att) - REPO_ROWS), "faint"), False, False, 0)
+        self.rows.show_all()
+
+        gen = st.get("generated_at", 0)
+        nxt = gen + st.get("interval_seconds", 7200)
+        foot = "last %s · next %s" % (time.strftime("%H:%M", time.localtime(gen)),
+                                           time.strftime("%H:%M", time.localtime(nxt)))
+        off = t.get("disabled", 0)
+        if off: foot += " · %d off" % off
+        if os.path.exists(REPO_OFFLINE):
+            # the sweep keeps the last good numbers during an outage and drops
+            # this marker; say so, or the panel reads as current when it isn't
+            try: since = int(open(REPO_OFFLINE).read().split("\t")[0])
+            except Exception: since = 0
+            foot = "OFFLINE since %s · %s" % (
+                time.strftime("%H:%M", time.localtime(since)), foot)
+        self.foot.set_text(foot)
+        return True
+
+
+class ReposSettings(Gtk.Window):
+    """Checklist of every discovered repo + the roots they're discovered under.
+    Unticked repos are written to config.json's `disabled` list by path."""
+    def __init__(self, parent):
+        super().__init__(title="REPOS :// SETTINGS")
+        self.parent_widget = parent
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_keep_above(True)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_default_size(560, 640)
+        self.set_app_paintable(True)
+        vis = self.get_screen().get_rgba_visual()
+        if vis: self.set_visual(vis)
+        self.connect("key-press-event", self._key)
+
+        cfg = repo_conf()
+        self.roots = list(cfg["roots"])
+        self.disabled = set(cfg["disabled"])
+        self.checks = {}                    # path -> Gtk.CheckButton
+
+        outer = vbox(8, m=22)
+        hdr = Gtk.Box(spacing=8)
+        title = L("REPOS :// SETTINGS", "title"); title.set_hexpand(True); title.set_xalign(0)
+        close = Gtk.Button(label="✕")
+        close.get_style_context().add_class("caret")
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        close.connect("clicked", lambda *_: self.destroy())
+        hdr.pack_start(title, True, True, 0)
+        hdr.pack_end(close, False, False, 0)
+        outer.pack_start(hdr, False, False, 0)
+        outer.pack_start(rule(), False, False, 0)
+
+        # --- add a path -----------------------------------------------------
+        addrow = Gtk.Box(spacing=6)
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text("add a folder of repos, or one repo…")
+        self.entry.set_hexpand(True)
+        self.entry.connect("activate", lambda *_: self.add_root())
+        browse = Gtk.Button(label="BROWSE"); browse.get_style_context().add_class("tile")
+        browse.set_relief(Gtk.ReliefStyle.NONE); browse.connect("clicked", self.browse)
+        addb = Gtk.Button(label="ADD"); addb.get_style_context().add_class("tile")
+        addb.set_relief(Gtk.ReliefStyle.NONE); addb.connect("clicked", lambda *_: self.add_root())
+        addrow.pack_start(self.entry, True, True, 0)
+        addrow.pack_start(browse, False, False, 0)
+        addrow.pack_start(addb, False, False, 0)
+        outer.pack_start(addrow, False, False, 0)
+        self.err = L("", "faint")
+        outer.pack_start(self.err, False, False, 0)
+
+        # --- the list -------------------------------------------------------
+        self.listbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+        scroll.add(self.listbox)
+        outer.pack_start(scroll, True, True, 0)
+
+        outer.pack_start(rule(), False, False, 0)
+
+        # --- bulk actions ---------------------------------------------------
+        bulk = Gtk.Box(spacing=6)
+        for label, fn in (("ALL", lambda *_: self.set_all(True)),
+                          ("NONE", lambda *_: self.set_all(False)),
+                          ("INVERT", lambda *_: self.invert())):
+            btn = Gtk.Button(label=label); btn.get_style_context().add_class("tile")
+            btn.set_relief(Gtk.ReliefStyle.NONE); btn.connect("clicked", fn)
+            btn.set_hexpand(True)
+            bulk.pack_start(btn, True, True, 0)
+        outer.pack_start(bulk, False, False, 0)
+
+        act = Gtk.Box(spacing=6)
+        save = Gtk.Button(label="SAVE & SYNC NOW"); save.get_style_context().add_class("tile")
+        save.set_relief(Gtk.ReliefStyle.NONE); save.connect("clicked", self.save_and_sync)
+        save.set_hexpand(True)
+        act.pack_start(save, True, True, 0)
+        outer.pack_start(act, False, False, 0)
+
+        self.add(outer)
+        self.rebuild()
+
+    def _key(self, w, e):
+        if e.keyval == Gdk.KEY_Escape: self.destroy()
+        return False
+
+    # ---- roots -------------------------------------------------------------
+    def browse(self, *_):
+        dlg = Gtk.FileChooserDialog(title="Add a repo folder", parent=self,
+                                    action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Add", Gtk.ResponseType.OK)
+        dlg.set_current_folder(os.path.expanduser("~"))
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.entry.set_text(dlg.get_filename() or "")
+            dlg.destroy(); self.add_root()
+        else:
+            dlg.destroy()
+
+    def add_root(self):
+        p = os.path.abspath(os.path.expanduser(self.entry.get_text().strip()))
+        if not p or p == "/":
+            return
+        if not os.path.isdir(p):
+            self.err.set_text("not a folder: %s" % p); return
+        if p in [os.path.expanduser(r) for r in self.roots]:
+            self.err.set_text("already added"); return
+        if not discover_repos([p]):
+            self.err.set_text("no git repos found in %s" % p); return
+        self.roots.append(p)
+        self.entry.set_text(""); self.err.set_text("")
+        self.rebuild()
+
+    def remove_root(self, root):
+        if len(self.roots) <= 1:
+            self.err.set_text("keep at least one folder"); return
+        self.roots = [r for r in self.roots if r != root]
+        self.rebuild()
+
+    # ---- checklist ---------------------------------------------------------
+    def rebuild(self):
+        for ch in self.listbox.get_children(): self.listbox.remove(ch)
+        self.checks.clear()
+        repos = discover_repos(self.roots)
+        by_root = {}
+        for path, root in repos: by_root.setdefault(root, []).append(path)
+
+        for root in self.roots:
+            root_x = os.path.expanduser(root)
+            head = Gtk.Box(spacing=8)
+            lbl = L(root_x.replace(os.path.expanduser("~"), "~"), "k")
+            lbl.set_hexpand(True); lbl.set_xalign(0)
+            rm = Gtk.Button(label="✕")
+            rm.get_style_context().add_class("caret"); rm.set_relief(Gtk.ReliefStyle.NONE)
+            rm.set_tooltip_text("stop scanning this folder")
+            rm.connect("clicked", lambda _b, r=root: self.remove_root(r))
+            head.pack_start(lbl, True, True, 0)
+            head.pack_end(rm, False, False, 0)
+            self.listbox.pack_start(head, False, False, 0)
+
+            paths = by_root.get(root_x, [])
+            if not paths:
+                self.listbox.pack_start(L("   (no repos here)", "faint"), False, False, 0)
+            for p in paths:
+                cb = Gtk.CheckButton(label=os.path.basename(p))
+                cb.set_active(p not in self.disabled)
+                cb.get_style_context().add_class("v")
+                cb.set_margin_start(10)
+                self.checks[p] = cb
+                self.listbox.pack_start(cb, False, False, 0)
+            self.listbox.pack_start(rule(), False, False, 0)
+        self.listbox.show_all()
+
+    def set_all(self, on):
+        for cb in self.checks.values(): cb.set_active(on)
+
+    def invert(self):
+        for cb in self.checks.values(): cb.set_active(not cb.get_active())
+
+    # ---- persist -----------------------------------------------------------
+    def save_and_sync(self, *_):
+        # Keep disabled entries for paths we can't currently see (an unplugged
+        # drive, a removed root) so unticking them isn't silently forgotten.
+        visible = set(self.checks)
+        keep = {d for d in self.disabled if d not in visible}
+        off = {p for p, cb in self.checks.items() if not cb.get_active()}
+        save_repo_conf(self.roots, sorted(keep | off))
+        self.disabled = keep | off
+        self.parent_widget.sync_now()
+        self.destroy()
+
 # ---------- main ----------
 def main():
     apply_css()
@@ -2047,7 +2373,7 @@ def main():
         _w.set_size_request(NOTES_W if _n == "notes" else POPOUT_W, -1)
     # --- the pane: the five cards worth seeing at a glance ---
     pane = [Clock(), System(), Status(), Network(), NowPlaying(), Sessions()]
-    chrome = [Rail(rail_targets), AssistantOrb(assistant), Launcher()]
+    chrome = [Rail(rail_targets), AssistantOrb(assistant), Launcher(), Repos()]
     for w in pane + chrome: w.show_all()
     start_pulse()
     GLib.idle_add(relayout_pane)          # stack the column once real sizes are known
