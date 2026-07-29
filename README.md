@@ -52,7 +52,7 @@ dot field, and sonar pings (Cairo, ~5fps).
 
 ## Install
 
-Tested on Linux Mint 22.1 · Cinnamon · X11.
+Tested on Linux Mint 22.3 (Zena) · Cinnamon · X11.
 
 **1 — System packages** (Debian/Ubuntu/Mint):
 
@@ -124,6 +124,34 @@ The two root-owned targets (apt cache, journal) need a pinned sudoers rule:
 ```
 
 Without it those rows read `AUTH` and `CLEAN NOW` skips them — nothing hangs.
+
+## System updates
+
+An `apt` upgrade never touches `$HOME`, so the widgets, conky config, fonts and
+Vicinae settings are not at risk. Two things are:
+
+1. **`/etc` files you have modified** — dpkg offers to replace them. On this
+   machine that's `zram-generator.conf`, `default-wifi-powersave-on.conf` and
+   `cryptsetup-initramfs/conf-hook`.
+2. **Cinnamon dconf settings** — panel layout, keybindings, themes. Safe in
+   practice, but worth being able to prove.
+
+Both are recorded in `docs/desktop-state/`, and:
+
+```bash
+./bin/mint-update --dry-run   # see what would change
+./bin/mint-update             # upgrade, keeping every /etc file you edited
+./bin/verify-desktop          # report drift against the recorded baseline
+./bin/verify-desktop --update # accept current state as the new baseline
+```
+
+`mint-update` runs `apt upgrade` (never `full-upgrade`, which can remove packages
+to satisfy dependencies), passes `--force-confold` so your config files win, lists
+anything held back rather than forcing it, and finishes by running
+`verify-desktop`. Where dpkg keeps your file it parks the new one as
+`*.dpkg-dist`, and the script points them out.
+
+Run it from a real terminal — it needs your sudo password.
 
 ## Backup workflow
 

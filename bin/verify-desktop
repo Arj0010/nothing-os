@@ -1,0 +1,108 @@
+#!/bin/bash
+# Compare the live desktop against the state recorded in docs/desktop-state/.
+# Run it after a system update to prove nothing was silently reset.
+#
+#   ./bin/verify-desktop            # report drift
+#   ./bin/verify-desktop --update   # accept current state as the new baseline
+#
+# Exits non-zero if anything drifted, so it can gate a script.
+
+R="$(cd "$(dirname "$0")/.." && pwd)"
+S="$R/docs/desktop-state"
+fail=0
+
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+dim()  { printf '\033[2m%s\033[0m\n' "$*"; }
+
+if [ "$1" = "--update" ]; then
+  dconf dump /org/cinnamon/      > "$S/cinnamon.dconf"
+  dconf dump /org/gnome/desktop/ > "$S/gnome-desktop.dconf"
+  dconf dump /org/nemo/          > "$S/nemo.dconf"
+  apt-mark showmanual | sort     > "$S/packages-manual.txt"
+  for f in /etc/systemd/zram-generator.conf \
+           /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf \
+           /etc/cryptsetup-initramfs/conf-hook; do
+    [ -f "$f" ] && cp "$f" "$S/etc/$(basename "$f")"
+  done
+  grn "baseline updated."; exit 0
+fi
+
+check_dconf() {   # $1 = dconf path, $2 = baseline file
+  local now; now="$(mktemp)"
+  dconf dump "$1" > "$now"
+  if diff -q "$2" "$now" >/dev/null 2>&1; then
+    grn "  ok      $1"
+  else
+    red "  DRIFT   $1"
+    diff "$2" "$now" | head -20 | sed 's/^/          /'
+    fail=1
+  fi
+  rm -f "$now"
+}
+
+echo "dconf settings (panel, keybindings, themes)"
+check_dconf /org/cinnamon/      "$S/cinnamon.dconf"
+check_dconf /org/gnome/desktop/ "$S/gnome-desktop.dconf"
+check_dconf /org/nemo/          "$S/nemo.dconf"
+
+echo
+echo "/etc files you modified (an upgrade can overwrite these)"
+for f in /etc/systemd/zram-generator.conf \
+         /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf \
+         /etc/cryptsetup-initramfs/conf-hook; do
+  b="$S/etc/$(basename "$f")"
+  if [ ! -f "$b" ]; then
+    dim "  skip    $f (no baseline)"
+  elif [ ! -f "$f" ]; then
+    red "  MISSING $f"; fail=1
+  elif cmp -s "$b" "$f"; then
+    grn "  ok      $f"
+  else
+    red "  DRIFT   $f"
+    diff "$b" "$f" | head -20 | sed 's/^/          /'
+    # apt leaves the replacement next to the original — say so, it is the fix
+    [ -f "$f.dpkg-old" ] && dim "          your version was saved as $f.dpkg-old"
+    fail=1
+  fi
+done
+
+echo
+echo "desktop files (live vs repo)"
+for pair in \
+  "$HOME/.config/nothing-widgets/nothing-widgets.py:$R/nothing-widgets/nothing-widgets.py" \
+  "$HOME/.config/nothing-widgets/cleaner_core.py:$R/nothing-widgets/cleaner_core.py" \
+  "$HOME/.config/conky/nothing/bg.conf:$R/conky/bg.conf" \
+  "$HOME/.config/autostart/nothing-conky.desktop:$R/nothing-conky.desktop" \
+  "$HOME/.local/bin/shot:$R/bin/shot"; do
+  live="${pair%%:*}"; repo="${pair##*:}"
+  if [ ! -f "$live" ]; then
+    red "  MISSING $live"; fail=1
+  elif cmp -s "$live" "$repo"; then
+    grn "  ok      $(basename "$live")"
+  else
+    dim "  differs $(basename "$live")  (run ./sync.sh if the live copy is newer)"
+  fi
+done
+
+echo
+echo "running processes"
+for p in "nothing-widgets.py:widgets" "conky:conky"; do
+  pat="${p%%:*}"; name="${p##*:}"
+  if pgrep -f "$pat" >/dev/null; then grn "  ok      $name running"
+  else red "  DOWN    $name"; fail=1; fi
+done
+if systemctl --user is-active --quiet vicinae.service; then grn "  ok      vicinae running"
+else red "  DOWN    vicinae"; fail=1; fi
+
+echo
+echo "fonts"
+for f in "Ndot" "NType" "Lettera"; do
+  if fc-list 2>/dev/null | grep -qi "$f"; then grn "  ok      $f present"
+  else red "  MISSING $f font"; fail=1; fi
+done
+
+echo
+if [ "$fail" = 0 ]; then grn "no drift — everything intact."
+else red "drift detected (see above)."; fi
+exit $fail

@@ -1,0 +1,82 @@
+#!/bin/bash
+# Update Linux Mint without losing local modifications.
+#
+#   ./bin/mint-update            # update, keeping every /etc file you changed
+#   ./bin/mint-update --dry-run  # show what would be upgraded, change nothing
+#
+# Needs your sudo password (run it from a real terminal, not from an agent).
+#
+# Why the dpkg flags: when a package ships a new version of a config file you
+# have edited, dpkg normally stops and asks. Unattended, the wrong answer
+# silently replaces your file. --force-confold keeps yours; --force-confdef lets
+# dpkg take its default only where you have NOT edited anything. Your zram,
+# NetworkManager and cryptsetup edits survive. The new upstream version is left
+# beside yours as *.dpkg-dist if you ever want to compare.
+
+set -u
+R="$(cd "$(dirname "$0")/.." && pwd)"
+KEEP=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+DRY=""; [ "${1:-}" = "--dry-run" ] && DRY="--dry-run"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+
+bold "== 1/5  baseline =="
+# Record current state first, so drift is measurable afterwards. Skipped on a
+# dry run: there is nothing to drift from.
+if [ -z "$DRY" ]; then
+  "$R/bin/verify-desktop" --update >/dev/null && grn "recorded to docs/desktop-state/"
+fi
+dpkg -l | awk '/^ii/{print $2"\t"$3}' | sort > /tmp/mint-update-before.txt
+
+bold "== 2/5  refresh package lists =="
+sudo apt update || { red "apt update failed"; exit 1; }
+
+bold "== 3/5  pending =="
+apt list --upgradable 2>/dev/null | tail -n +2
+n=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c .)
+if [ "$n" = 0 ]; then grn "already up to date."; exit 0; fi
+echo "$n package(s) to upgrade"
+
+bold "== 4/5  upgrade =="
+# `upgrade`, not `full-upgrade`: it never removes a package to satisfy a
+# dependency, which is the failure mode that quietly takes a desktop apart.
+# Anything held back is reported below rather than forced through.
+sudo apt $DRY "${KEEP[@]}" upgrade || { red "upgrade failed"; exit 1; }
+
+if [ -n "$DRY" ]; then grn "dry run — nothing changed."; exit 0; fi
+
+held=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c .)
+if [ "$held" -gt 0 ]; then
+  red "$held package(s) held back (need new dependencies):"
+  apt list --upgradable 2>/dev/null | tail -n +2
+  echo "review them, then if you are happy:  sudo apt ${KEEP[*]} full-upgrade"
+fi
+
+bold "== 5/5  verify =="
+dpkg -l | awk '/^ii/{print $2"\t"$3}' | sort > /tmp/mint-update-after.txt
+changed=$(comm -13 /tmp/mint-update-before.txt /tmp/mint-update-after.txt | wc -l)
+gone=$(comm -23 /tmp/mint-update-before.txt /tmp/mint-update-after.txt | cut -f1 \
+       | comm -23 - <(cut -f1 /tmp/mint-update-after.txt) | wc -l)
+echo "$changed package version(s) changed, $gone package(s) removed"
+[ "$gone" -gt 0 ] && red "removed packages — check: comm -23 /tmp/mint-update-before.txt /tmp/mint-update-after.txt"
+
+# Any *.dpkg-dist file means dpkg kept YOUR config and parked the new one.
+newconf=$(find /etc -name "*.dpkg-dist" -newermt "-1 hour" 2>/dev/null)
+if [ -n "$newconf" ]; then
+  bold "config files where yours was kept (new version parked alongside):"
+  echo "$newconf"
+fi
+
+echo
+# Compare against the baseline recorded in step 1 — this is the actual answer to
+# "did the update change anything I set up?"
+"$R/bin/verify-desktop"
+vd=$?
+
+if [ -f /var/run/reboot-required ]; then
+  bold "reboot required (kernel or core library updated)"
+  cat /var/run/reboot-required.pkgs 2>/dev/null | sort -u | head
+fi
+exit $vd
