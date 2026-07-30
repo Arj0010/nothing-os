@@ -312,6 +312,55 @@ def revive(snapshot, wait=4.0):
                 break
     return back
 
+# ---------- power profile ----------
+# power-profiles-daemon owns CPU policy on this machine, so this is the only knob
+# that sticks: writing scaling_governor or energy_performance_preference directly
+# gets reverted the next time the daemon re-asserts itself. It also needs no root —
+# PPD exposes the switch over polkit to the active session.
+PPCTL = "/usr/bin/powerprofilesctl"
+
+def power_profile():
+    """Current profile name, or "" if power-profiles-daemon isn't answering."""
+    if not os.path.exists(PPCTL):
+        return ""
+    ok, out = _run([PPCTL, "get"], timeout=5)
+    return out.strip() if ok else ""
+
+def set_power_profile(name):
+    if not os.path.exists(PPCTL):
+        return False
+    ok, _ = _run([PPCTL, "set", name], timeout=10)
+    return ok
+
+def on_ac():
+    """True when plugged in. On battery PPD caps the ceiling whatever profile is
+    selected, so the card says so rather than promising speed it cannot deliver."""
+    try:
+        for name in os.listdir("/sys/class/power_supply"):
+            if not name.startswith("A"):      # ADP0 / AC / ACAD
+                continue
+            p = os.path.join("/sys/class/power_supply", name, "online")
+            try:
+                if open(p).read().strip() == "1":
+                    return True
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return False
+
+def cpu_mhz():
+    """Highest current core clock, in MHz — the visible effect of the profile."""
+    best = 0.0
+    try:
+        for ln in open("/proc/cpuinfo"):
+            if ln.startswith("cpu MHz"):
+                try: best = max(best, float(ln.split(":")[1]))
+                except (IndexError, ValueError): pass
+    except OSError:
+        pass
+    return int(best)
+
 # ---------- processes ----------
 PAGE = os.sysconf("SC_PAGE_SIZE")
 

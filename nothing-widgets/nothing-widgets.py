@@ -1650,6 +1650,23 @@ class Cleaner(Widget):
 
         self.status = L("SCANNING", "faint"); body.pack_start(self.status, False, False, 0)
 
+        # --- performance mode ------------------------------------------------
+        # Needs no root, and unlike the disk cleaners it is instantly reversible,
+        # so it is a plain toggle with no SURE? arming.
+        prow = Gtk.Box(spacing=8)
+        self.perfbtn = Gtk.Button(label="PERF")
+        self.perfbtn.get_style_context().add_class("tile")
+        self.perfbtn.set_relief(Gtk.ReliefStyle.NONE)
+        self.perfbtn.set_size_request(96, 30)
+        self.perfbtn.connect("clicked", self._toggle_perf)
+        self.perflbl = L("", "dim"); self.perflbl.set_xalign(0)
+        self.perfmhz = L("", "dim"); self.perfmhz.set_xalign(1)
+        prow.pack_start(self.perfbtn, False, False, 0)
+        prow.pack_start(self.perflbl, True, True, 0)
+        prow.pack_end(self.perfmhz, False, False, 0)
+        body.pack_start(rule(), False, False, 0)
+        body.pack_start(prow, False, False, 0)
+
         body.pack_start(rule(), False, False, 0)
         self.tbox = vbox_plain(3); body.pack_start(self.tbox, False, False, 0)
 
@@ -1669,8 +1686,50 @@ class Cleaner(Widget):
             return
         self.first(self._scan_async)
         self.first(self._sample)
+        self.first(self._render_perf)
         GLib.timeout_add(self.RESCAN_MS, self._scan_async)
         GLib.timeout_add(self.SAMPLE_MS, self._sample)
+        # Clocks move constantly and the profile can change from outside (the Mint
+        # applet, a lid close), so refresh this faster than the 30 s sampler.
+        GLib.timeout_add(3000, self._perf_tick)
+
+    # ---- performance mode --------------------------------------------------
+    def _toggle_perf(self, *_):
+        want = "balanced" if self._profile == "performance" else "performance"
+        self.perfbtn.set_sensitive(False)
+        def work():
+            cleaner_core.set_power_profile(want)
+            GLib.idle_add(self._perf_done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _perf_done(self):
+        self.perfbtn.set_sensitive(True)
+        self._render_perf()
+        return False
+
+    _profile = ""
+
+    def _perf_tick(self):
+        # `powerprofilesctl get` is a subprocess; only pay for it while on screen.
+        if self.get_visible() and not self._collapsed:
+            self._render_perf()
+        return True
+
+    def _render_perf(self):
+        if cleaner_core is None: return
+        self._profile = cleaner_core.power_profile()
+        perf = self._profile == "performance"
+        ctx = self.perfbtn.get_style_context()
+        (ctx.add_class if perf else ctx.remove_class)("on")
+        if not self._profile:
+            self.perflbl.set_text("no power daemon")
+        elif not cleaner_core.on_ac():
+            # Saying "PERFORMANCE" while unplugged would overstate it: PPD keeps a
+            # lower ceiling on battery no matter which profile is selected.
+            self.perflbl.set_text("%s · ON BATTERY" % self._profile.upper())
+        else:
+            self.perflbl.set_text(self._profile.upper())
+        self.perfmhz.set_text("%d MHz" % cleaner_core.cpu_mhz())
 
     # ---- arming: a stray click must never delete a cache or kill an app ----
     def _confirm(self, btn, label, action):

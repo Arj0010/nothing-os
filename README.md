@@ -114,6 +114,12 @@ you can tell there's something to clean without opening the card.
   and the card reports `RESTARTED …`.
 - **The memory timeline** samples top processes every 30 s to a 7-day rolling log,
   showing per-app peak RSS. `KILL` sends `SIGTERM` only and asks `SURE?` first.
+- **`PERF` switch** toggles the power profile. It drives `powerprofilesctl`, not
+  `scaling_governor` — `power-profiles-daemon` owns CPU policy here and reverts
+  hand-written sysfs values. Needs no root (PPD exposes it over polkit), and it is
+  a plain toggle with no `SURE?` because it is instantly reversible. Measured
+  2701 → 3765 MHz. The row says `ON BATTERY` when unplugged, since PPD keeps a
+  lower ceiling regardless of the profile selected.
 - **No `drop_caches`.** It would discard useful page cache and make the machine
   slower, not faster.
 

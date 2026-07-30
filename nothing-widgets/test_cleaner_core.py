@@ -263,6 +263,50 @@ class AliveTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class PowerTest(unittest.TestCase):
+    """The PERF switch drives power-profiles-daemon rather than sysfs, because PPD
+    owns CPU policy here and reverts hand-written governor/EPP values."""
+
+    def test_power_profile_returns_a_known_name_or_empty(self):
+        p = cc.power_profile()
+        self.assertIsInstance(p, str)
+        if p:
+            self.assertIn(p, ("performance", "balanced", "power-saver"))
+
+    def test_power_profile_is_empty_when_the_tool_is_absent(self):
+        saved = cc.PPCTL
+        cc.PPCTL = "/nonexistent/powerprofilesctl"
+        try:
+            self.assertEqual(cc.power_profile(), "")
+            self.assertFalse(cc.set_power_profile("performance"))
+        finally:
+            cc.PPCTL = saved
+
+    def test_on_ac_returns_a_bool(self):
+        self.assertIsInstance(cc.on_ac(), bool)
+
+    def test_cpu_mhz_is_plausible(self):
+        m = cc.cpu_mhz()
+        self.assertGreater(m, 100)
+        self.assertLess(m, 10000)
+
+    def test_setting_the_profile_round_trips(self):
+        """Skipped when PPD is absent. Restores whatever was selected."""
+        before = cc.power_profile()
+        if not before:
+            self.skipTest("power-profiles-daemon not available")
+        other = "balanced" if before == "performance" else "performance"
+        try:
+            if not cc.set_power_profile(other):
+                self.skipTest("not authorised to change profile")
+            time.sleep(1.0)
+            self.assertEqual(cc.power_profile(), other)
+        finally:
+            cc.set_power_profile(before)
+            time.sleep(0.5)
+            self.assertEqual(cc.power_profile(), before)
+
+
 class TargetsTest(unittest.TestCase):
     def test_keys_are_unique(self):
         keys = [t.key for t in cc.TARGETS]
