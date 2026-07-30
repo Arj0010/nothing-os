@@ -151,7 +151,10 @@ anything held back rather than forcing it, and finishes by running
 `verify-desktop`. Where dpkg keeps your file it parks the new one as
 `*.dpkg-dist`, and the script points them out.
 
-Run it from a real terminal — it needs your sudo password.
+It needs your sudo password. In a terminal it asks there; with no controlling
+terminal — an agent, a hotkey, a `.desktop` launcher — it pops a zenity dialog on
+`$DISPLAY` instead, because `sudo` otherwise aborts with "a terminal is required"
+before doing any work.
 
 ## Backup workflow
 

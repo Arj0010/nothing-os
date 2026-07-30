@@ -4,7 +4,8 @@
 #   ./bin/mint-update            # update, keeping every /etc file you changed
 #   ./bin/mint-update --dry-run  # show what would be upgraded, change nothing
 #
-# Needs your sudo password (run it from a real terminal, not from an agent).
+# Needs your sudo password. In a real terminal it asks there; with no controlling
+# terminal (an agent, a hotkey, a .desktop launcher) it pops a graphical prompt.
 #
 # Why the dpkg flags: when a package ships a new version of a config file you
 # have edited, dpkg normally stops and asks. Unattended, the wrong answer
@@ -22,6 +23,33 @@ bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
 
+# --- how to ask for the password ------------------------------------------
+# sudo can only prompt on a controlling terminal. Run from anywhere without one
+# and it aborts with "a terminal is required" before doing any work, which is
+# how this script first failed. When there is no tty but there IS a display,
+# hand sudo a graphical askpass instead.
+SUDO=(sudo)
+if ! sudo -n true 2>/dev/null; then
+  if [ -t 0 ]; then
+    :                                   # real terminal — sudo prompts itself
+  elif [ -n "${DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+    ASKPASS="$(mktemp)"
+    cat > "$ASKPASS" <<'EOS'
+#!/bin/sh
+zenity --password --title="Mint update" 2>/dev/null
+EOS
+    chmod 700 "$ASKPASS"
+    export SUDO_ASKPASS="$ASKPASS"
+    SUDO=(sudo -A)
+    trap 'rm -f "$ASKPASS"' EXIT
+    bold "no terminal here — asking for your password in a dialog on :0"
+  else
+    red "sudo needs a password, and there is no terminal or display to ask on."
+    red "run this from a terminal window instead."
+    exit 1
+  fi
+fi
+
 bold "== 1/5  baseline =="
 # Record current state first, so drift is measurable afterwards. Skipped on a
 # dry run: there is nothing to drift from.
@@ -31,7 +59,7 @@ fi
 dpkg -l | awk '/^ii/{print $2"\t"$3}' | sort > /tmp/mint-update-before.txt
 
 bold "== 2/5  refresh package lists =="
-sudo apt update || { red "apt update failed"; exit 1; }
+"${SUDO[@]}" apt update || { red "apt update failed"; exit 1; }
 
 bold "== 3/5  pending =="
 apt list --upgradable 2>/dev/null | tail -n +2
@@ -43,7 +71,7 @@ bold "== 4/5  upgrade =="
 # `upgrade`, not `full-upgrade`: it never removes a package to satisfy a
 # dependency, which is the failure mode that quietly takes a desktop apart.
 # Anything held back is reported below rather than forced through.
-sudo apt $DRY "${KEEP[@]}" upgrade || { red "upgrade failed"; exit 1; }
+"${SUDO[@]}" apt $DRY "${KEEP[@]}" upgrade || { red "upgrade failed"; exit 1; }
 
 if [ -n "$DRY" ]; then grn "dry run — nothing changed."; exit 0; fi
 
