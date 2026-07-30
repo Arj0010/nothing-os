@@ -19,6 +19,14 @@ R="$(cd "$(dirname "$0")/.." && pwd)"
 KEEP=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 DRY=""; [ "${1:-}" = "--dry-run" ] && DRY="--dry-run"
 
+# Absolute paths on purpose. Mint installs a wrapper at /usr/local/bin/apt which
+# wins on PATH, accepts options only AFTER the command, and prints "apt does not
+# have a stable CLI interface, use with caution in scripts" — it rejected the
+# dpkg options this script depends on and dumped its help instead. apt-get is the
+# scripting interface; /usr/bin/apt is the real apt, used only for `list`.
+APTGET=/usr/bin/apt-get
+APT=/usr/bin/apt
+
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -59,11 +67,24 @@ fi
 dpkg -l | awk '/^ii/{print $2"\t"$3}' | sort > /tmp/mint-update-before.txt
 
 bold "== 2/5  refresh package lists =="
-"${SUDO[@]}" apt update || { red "apt update failed"; exit 1; }
+upd="$(mktemp)"
+"${SUDO[@]}" "$APTGET" update 2>&1 | tee "$upd"
+rc=${PIPESTATUS[0]}
+[ "$rc" = 0 ] || { red "apt-get update failed"; rm -f "$upd"; exit 1; }
+# A repo that fails to refresh does NOT fail the update — apt quietly reuses the
+# old index, so you can sit on stale packages indefinitely without noticing.
+if grep -q "^Err:" "$upd"; then
+  echo
+  red "these repositories did NOT refresh (apt is using their old indexes):"
+  grep "^Err:" "$upd" | sed 's/^/  /'
+  grep -o "NO_PUBKEY [A-F0-9]*" "$upd" | sort -u \
+    | sed 's/^/  missing signing key: /'
+fi
+rm -f "$upd"
 
 bold "== 3/5  pending =="
-apt list --upgradable 2>/dev/null | tail -n +2
-n=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c .)
+"$APT" list --upgradable 2>/dev/null | tail -n +2
+n=$("$APT" list --upgradable 2>/dev/null | tail -n +2 | grep -c .)
 if [ "$n" = 0 ]; then grn "already up to date."; exit 0; fi
 echo "$n package(s) to upgrade"
 
@@ -71,15 +92,15 @@ bold "== 4/5  upgrade =="
 # `upgrade`, not `full-upgrade`: it never removes a package to satisfy a
 # dependency, which is the failure mode that quietly takes a desktop apart.
 # Anything held back is reported below rather than forced through.
-"${SUDO[@]}" apt $DRY "${KEEP[@]}" upgrade || { red "upgrade failed"; exit 1; }
+"${SUDO[@]}" "$APTGET" $DRY "${KEEP[@]}" upgrade || { red "upgrade failed"; exit 1; }
 
 if [ -n "$DRY" ]; then grn "dry run — nothing changed."; exit 0; fi
 
-held=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c .)
+held=$("$APT" list --upgradable 2>/dev/null | tail -n +2 | grep -c .)
 if [ "$held" -gt 0 ]; then
   red "$held package(s) held back (need new dependencies):"
-  apt list --upgradable 2>/dev/null | tail -n +2
-  echo "review them, then if you are happy:  sudo apt ${KEEP[*]} full-upgrade"
+  "$APT" list --upgradable 2>/dev/null | tail -n +2
+  echo "review them, then if you are happy:  sudo $APTGET ${KEEP[*]} full-upgrade"
 fi
 
 bold "== 5/5  verify =="
