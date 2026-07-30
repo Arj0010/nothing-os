@@ -156,6 +156,30 @@ terminal — an agent, a hotkey, a `.desktop` launcher — it pops a zenity dial
 `$DISPLAY` instead, because `sudo` otherwise aborts with "a terminal is required"
 before doing any work.
 
+## Local-model tuning
+
+```bash
+./bin/llm-tune status   # power profile, AVX-512 features, zram, Intel GPU stack
+./bin/llm-tune on       # performance power profile
+./bin/llm-tune off      # back to balanced
+./bin/llm-tune bench    # single-thread STREAM triad
+```
+
+Needs no sudo — `power-profiles-daemon` exposes this over polkit to the active
+session. That's also *why* it uses `powerprofilesctl` rather than writing
+`scaling_governor`: PPD is what actually sets CPU policy here, so hand-written
+sysfs values get reverted the next time the daemon re-asserts itself.
+
+Measured on this machine (i5-1135G7, on battery): balanced **15.0 GB/s** →
+performance **17.4 GB/s** single-thread triad, with core clocks going 2900 →
+3800 MHz. CPU inference is memory-bandwidth-bound, so that bandwidth number
+tracks tokens/sec more closely than clock speed does.
+
+`vm.swappiness` is deliberately left at 140. It looks alarming next to the stock
+60, but this machine swaps to zram (8 GB, compressed RAM) and a high value is the
+correct pairing. Lowering it trades "model pages get compressed" for "model pages
+go to disk", which is worse.
+
 ## Backup workflow
 
 Live files are edited under `~/.config`; `./sync.sh` copies them back here, then

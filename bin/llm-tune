@@ -1,0 +1,129 @@
+#!/bin/bash
+# Put the machine into its fastest state for local model inference, and back.
+#
+#   ./bin/llm-tune status    # what the machine is doing right now
+#   ./bin/llm-tune on        # performance power profile
+#   ./bin/llm-tune off       # back to balanced
+#   ./bin/llm-tune bench     # measure single-thread memory bandwidth
+#
+# No sudo needed: power-profiles-daemon exposes this over polkit to the active
+# session. That matters — on this machine PPD is what actually sets the CPU
+# policy, so writing scaling_governor or energy_performance_preference by hand
+# gets silently reverted the next time the daemon re-asserts itself. Use its
+# interface, not sysfs.
+#
+# Deliberately NOT changed here: vm.swappiness. It reads 140, which looks alarming
+# next to the stock 60, but this machine swaps to zram (compressed RAM, 8 GB), and
+# a high value is the correct pairing for that. Lowering it trades "model pages get
+# compressed" for "model pages get evicted to disk", which is worse. If a model
+# genuinely does not fit, the fix is a smaller quant, not a swap knob.
+
+set -u
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+dim()  { printf '\033[2m%s\033[0m\n' "$*"; }
+
+have_ppd() { command -v powerprofilesctl >/dev/null 2>&1; }
+
+on_ac() {
+  for f in /sys/class/power_supply/A*/online; do
+    [ "$(cat "$f" 2>/dev/null)" = "1" ] && return 0
+  done
+  return 1
+}
+
+freqs() { grep "cpu MHz" /proc/cpuinfo | awk '{printf "%.0f ", $4}'; echo; }
+
+status() {
+  bold "power"
+  if have_ppd; then
+    echo "  profile     : $(powerprofilesctl get 2>/dev/null)"
+  else
+    red "  power-profiles-daemon not installed"
+  fi
+  echo "  driver      : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null)"
+  echo "  governor    : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+  echo "  EPP         : $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
+  echo "  turbo       : $([ "$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)" = "0" ] && echo enabled || echo DISABLED)"
+  if on_ac; then echo "  power source: AC"
+  else red "  power source: BATTERY — the profile will be capped whatever you set"; fi
+  echo "  core MHz    : $(freqs)"
+  echo "  max MHz     : $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null | awk '{printf "%.0f", $1/1000}')"
+
+  bold "inference-relevant CPU features"
+  # AVX-512 VNNI is the one that matters for int8 quantised inference, and it is
+  # unusual on a laptop — Intel removed AVX-512 from consumer chips after this gen.
+  for f in avx512f avx512_vnni avx512bw amx_int8; do
+    if grep -qm1 "\b$f\b" /proc/cpuinfo; then grn "  yes  $f"; else dim "  no   $f"; fi
+  done
+
+  bold "memory"
+  echo "  $(free -h | awk '/^Mem:/{print "total "$2"  used "$3"  available "$7}')"
+  echo "  swappiness  : $(cat /proc/sys/vm/swappiness) $(dim '(high is correct with zram)')"
+  echo "  zram        : $(zramctl --output NAME,DISKSIZE,DATA 2>/dev/null | tail -n +2 | tr -s ' ' || echo none)"
+  echo "  THP         : $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)"
+
+  bold "Intel GPU compute stack"
+  echo "  runtime     : $(dpkg-query -W -f='${Version}' intel-opencl-icd 2>/dev/null || echo 'not installed')"
+  echo "  level-zero  : $(dpkg-query -W -f='${Version}' libze-intel-gpu1 2>/dev/null || echo 'not installed')"
+  if command -v clinfo >/dev/null 2>&1; then
+    echo "  device      : $(clinfo -l 2>/dev/null | grep -m1 Device | sed 's/^ *//')"
+  fi
+}
+
+bench() {
+  # Single-thread STREAM triad. Reads the result so the compiler cannot delete the
+  # loop — an earlier version of this measured 53,000,000 GB/s for exactly that
+  # reason. Single-thread is the honest number for a bandwidth-bound decode step.
+  command -v gcc >/dev/null || { red "gcc not installed"; return 1; }
+  local d; d="$(mktemp -d)"
+  cat > "$d/bw.c" <<'EOF'
+#include <stdio.h>
+#include <time.h>
+#define N 40000000L
+static double a[N], b[N], c[N];
+int main(void){
+  for(long i=0;i<N;i++){a[i]=1.0;b[i]=2.0;}
+  double best=0, sink=0;
+  for(int r=0;r<5;r++){
+    struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+    for(long i=0;i<N;i++) c[i]=a[i]+2.0*b[i];
+    clock_gettime(CLOCK_MONOTONIC,&t1);
+    for(long i=0;i<N;i+=4096) sink+=c[i];
+    double dt=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
+    double gb=3.0*N*sizeof(double)/dt/1e9; if(gb>best)best=gb;
+  }
+  printf("%.1f\n", best);
+  if(sink<0) printf("");
+  return 0;
+}
+EOF
+  gcc -O2 -march=native -o "$d/bw" "$d/bw.c" 2>/dev/null || { red "compile failed"; rm -rf "$d"; return 1; }
+  local gb; gb="$("$d/bw")"
+  echo "  single-thread STREAM triad: ${gb} GB/s"
+  dim "  reference: LPDDR4x-4266 dual-channel peaks ~68 GB/s all-core;"
+  dim "  a single thread cannot saturate that, so compare runs, not to the peak."
+  rm -rf "$d"
+}
+
+case "${1:-status}" in
+  on)
+    have_ppd || { red "power-profiles-daemon not installed"; exit 1; }
+    on_ac || red "warning: on battery — performance will still be power-capped"
+    powerprofilesctl set performance || exit 1
+    sleep 2
+    grn "profile -> $(powerprofilesctl get)"
+    echo "  EPP      : $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
+    echo "  core MHz : $(freqs)"
+    dim "  not persistent across reboot by design — 'llm-tune off' or a reboot reverts"
+    ;;
+  off)
+    have_ppd || { red "power-profiles-daemon not installed"; exit 1; }
+    powerprofilesctl set balanced || exit 1
+    grn "profile -> $(powerprofilesctl get)"
+    ;;
+  bench)  bold "memory bandwidth"; bench ;;
+  status) status ;;
+  *) echo "usage: $0 {status|on|off|bench}"; exit 2 ;;
+esac
