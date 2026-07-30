@@ -126,7 +126,7 @@ POPOUT_W = 460          # every rail pop-out shares this width
 NOTES_W  = 560          # Notes gets extra room to actually read/write
 PANE_ORDER = ["clock", "system", "status", "net", "now", "sessions"]
 # Everything else is reachable from the RAIL: a slim icon strip on the left edge.
-RAIL_ORDER = ["controls", "pomo", "calendar", "notes", "arcade", "palette", "clean"]
+RAIL_ORDER = ["controls", "pomo", "calendar", "notes", "arcade", "palette"]
 PANE = {}          # wname -> Widget, filled as they are constructed
 
 def relayout_pane():
@@ -1574,6 +1574,27 @@ try:
 except Exception:      # the card degrades to a notice rather than killing the desktop
     cleaner_core = None
 
+MSPARK = "·▁▂▃▄▅▆▇█"
+def msparkline(vals, hi=0):
+    """Sparkline where an empty bucket is a dot, not a bar.
+
+    spark()'s glyph for zero is ▁, which draws a solid baseline across every
+    bucket with no sample in it — on a week-long axis that is most of the width,
+    and the result reads as a filled progress bar rather than sparse history.
+    """
+    vals = list(vals)
+    if not vals: return ""
+    top = hi or (max(vals) or 1)
+    out = []
+    for v in vals:
+        try: v = float(v)
+        except Exception: v = 0.0
+        if v <= 0:
+            out.append(MSPARK[0]); continue
+        v = min(top, v)
+        out.append(MSPARK[1 + int(v / top * (len(MSPARK) - 2))])
+    return "".join(out)
+
 def hsize(n):
     """human() with one decimal at GB. '1.5G' vs '1G' is the difference between
     bothering to clean and not."""
@@ -1597,43 +1618,52 @@ class Cleaner(Widget):
     SAMPLE_MS = 30000
 
     def __init__(self):
-        super().__init__("clean", 735, 40, POPOUT_W)
+        # Right column under REPOS, matching its x and width. A rail pop-out was
+        # the wrong home for this: it starts hidden, and opening any other pop-out
+        # closes it again, so the one number worth glancing at was never on screen.
+        super().__init__("clean", 1440, 270, 430)
         self.action = "gnome-system-monitor"
         self.scan_rows = []
-        self.reclaim = 0          # read by the rail to label its icon
+        self.reclaim = 0
         self.busy = False
         self.hist = cleaner_core.History() if cleaner_core else None
 
         b = vbox(7, m=22)
         self.tag = L("", "dim")
-        b.pack_start(self.header("CLEAN ://", subtitle=self.tag), False, False, 0)
+        b.pack_start(self.header("CLEAN ://", collapsible=True, subtitle=self.tag),
+                     False, False, 0)
+        # Everything below the header collapses behind the ▾ caret — this card is
+        # always on screen, so it needs to be able to get out of the way.
+        body = vbox_plain(7)
+        b.pack_start(body, False, False, 0)
 
         self.total = L("—", "clock2"); self.total.set_xalign(0)
-        b.pack_start(self.total, False, False, 0)
-        cap = L("RECLAIMABLE", "faint"); b.pack_start(cap, False, False, 0)
+        body.pack_start(self.total, False, False, 0)
+        cap = L("RECLAIMABLE", "faint"); body.pack_start(cap, False, False, 0)
 
         self.btn = Gtk.Button(label="CLEAN NOW")
         self.btn.get_style_context().add_class("tile")
         self.btn.set_relief(Gtk.ReliefStyle.NONE)
         self.btn.set_size_request(-1, 38)
         self.btn.connect("clicked", self._clean_now)
-        b.pack_start(self.btn, False, False, 0)
+        body.pack_start(self.btn, False, False, 0)
 
-        self.status = L("SCANNING", "faint"); b.pack_start(self.status, False, False, 0)
+        self.status = L("SCANNING", "faint"); body.pack_start(self.status, False, False, 0)
 
-        b.pack_start(rule(), False, False, 0)
-        self.tbox = vbox_plain(3); b.pack_start(self.tbox, False, False, 0)
+        body.pack_start(rule(), False, False, 0)
+        self.tbox = vbox_plain(3); body.pack_start(self.tbox, False, False, 0)
 
         self.heldlbl = L("HELD · not auto-cleaned", "faint")
-        b.pack_start(rule(), False, False, 0)
-        b.pack_start(self.heldlbl, False, False, 0)
-        self.hbox = vbox_plain(3); b.pack_start(self.hbox, False, False, 0)
+        body.pack_start(rule(), False, False, 0)
+        body.pack_start(self.heldlbl, False, False, 0)
+        self.hbox = vbox_plain(3); body.pack_start(self.hbox, False, False, 0)
 
-        b.pack_start(rule(), False, False, 0)
-        b.pack_start(L("MEMORY · 7d", "faint"), False, False, 0)
-        self.mbox = vbox_plain(3); b.pack_start(self.mbox, False, False, 0)
+        body.pack_start(rule(), False, False, 0)
+        body.pack_start(L("MEMORY · 7d", "faint"), False, False, 0)
+        self.mbox = vbox_plain(3); body.pack_start(self.mbox, False, False, 0)
 
         self.add(b)
+        self.setup_collapse(body)
         if cleaner_core is None:
             self.status.set_text("cleaner_core.py MISSING")
             return
@@ -1704,8 +1734,10 @@ class Cleaner(Widget):
             self.tbox.pack_start(self._target_row(r, mx), False, False, 0)
         locked = sum(r["bytes"] for r in flagged if r["state"] == "auth")
         if locked and not self.busy:
-            self.status.set_text("%s LOCKED · install.sh --with-cleaner-sudo"
-                                 % hsize(locked))
+            # No "--" in this string: the card font ligates it into an em dash, so
+            # the command rendered as "install.sh —with-cleaner-sudo" and looked
+            # mistyped. Name the thing needed instead of the exact flag.
+            self.status.set_text("%s LOCKED · needs the sudoers rule" % hsize(locked))
         for r in held:
             self.hbox.pack_start(self._held_row(r), False, False, 0)
         self.heldlbl.set_visible(bool(held))
@@ -1800,7 +1832,7 @@ class Cleaner(Widget):
     def _mem_row(self, s):
         row = Gtk.Box(spacing=8)
         k = L(s["name"][:12], "k"); k.set_size_request(96, -1)
-        sp = L(spark(s["points"], 0), "meter")
+        sp = L(msparkline(s["points"]), "meter")
         val = L(hsize(s["peak"]), "dim"); val.set_xalign(1); val.set_size_request(52, -1)
         row.pack_start(k, False, False, 0)
         row.pack_start(sp, True, True, 0)
@@ -1826,9 +1858,9 @@ class Rail(Widget):
     """A thin vertical launcher on the left edge. Each icon shows/hides its card
     with a short slide+fade, so the extra widgets stay one click away."""
     ICONS = {"controls": "◉", "pomo": "◔", "calendar": "▦",
-             "notes": "✎", "arcade": "◈", "palette": "◐", "clean": "◌"}
+             "notes": "✎", "arcade": "◈", "palette": "◐"}
     LABELS = {"controls": "CTRL", "pomo": "FOCUS", "calendar": "CAL",
-              "notes": "NOTE", "arcade": "PLAY", "palette": "SKIN", "clean": "CLEAN"}
+              "notes": "NOTE", "arcade": "PLAY", "palette": "SKIN"}
 
     def __init__(self, targets):
         super().__init__("rail", 8, 300)
@@ -1868,13 +1900,6 @@ class Rail(Widget):
                 tag.set_text(self.LABELS["pomo"])
                 if not p.get_visible():
                     self.btns["pomo"].get_style_context().remove_class("on")
-        # CLEAN keeps scanning while hidden, so the rail can answer "is there
-        # anything worth reclaiming?" without opening the card.
-        c = self.targets.get("clean")
-        tag = self.tags.get("clean")
-        if c is not None and tag is not None:
-            n = getattr(c, "reclaim", 0)
-            tag.set_text(hsize(n) if n else self.LABELS["clean"])
         return True
 
     def add(self, widget):     # the rail draws its own pill, not a .card
@@ -2633,13 +2658,12 @@ def main():
     assistant = Assistant()               # hidden; opened by the orb
     # --- rail pop-outs: built now, shown only when their icon is clicked ---
     rail_targets = {"controls": Controls(), "pomo": Pomodoro(), "calendar": Calendar(),
-                    "notes": Notes(), "arcade": Arcade(), "palette": Palette(),
-                    "clean": Cleaner()}
+                    "notes": Notes(), "arcade": Arcade(), "palette": Palette()}
     for _n, _w in rail_targets.items():
         _w.set_size_request(NOTES_W if _n == "notes" else POPOUT_W, -1)
     # --- the pane: the five cards worth seeing at a glance ---
     pane = [Clock(), System(), Status(), Network(), NowPlaying(), Sessions()]
-    chrome = [Rail(rail_targets), AssistantOrb(assistant), Launcher(), Repos()]
+    chrome = [Rail(rail_targets), AssistantOrb(assistant), Launcher(), Repos(), Cleaner()]
     for w in pane + chrome: w.show_all()
     start_pulse()
     GLib.idle_add(relayout_pane)          # stack the column once real sizes are known
