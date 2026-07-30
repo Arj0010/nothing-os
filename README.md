@@ -139,11 +139,18 @@ Vicinae settings are not at risk. Two things are:
 Both are recorded in `docs/desktop-state/`, and:
 
 ```bash
-./bin/mint-update --dry-run   # see what would change
-./bin/mint-update             # upgrade, keeping every /etc file you edited
-./bin/verify-desktop          # report drift against the recorded baseline
-./bin/verify-desktop --update # accept current state as the new baseline
+./bin/mint-update --dry-run        # see what would change
+./bin/mint-update                 # upgrade, keeping every /etc file you edited
+./bin/mint-update --prune-kernels # drop old kernels, keep running + 1 fallback
+./bin/verify-desktop              # report drift against the recorded baseline
+./bin/verify-desktop --update     # accept current state as the new baseline
 ```
+
+`--prune-kernels` exists because `apt autoremove` will not remove them: a kernel
+that was ever installed explicitly is marked MANUAL, and autoremove only reaps
+automatic packages. That left 5 old kernels and ~845 MB on a 90%-full disk here.
+It always keeps the running kernel plus the newest other one, and refuses to run
+if the running kernel somehow lands in the removal list.
 
 `mint-update` runs `apt upgrade` (never `full-upgrade`, which can remove packages
 to satisfy dependencies), passes `--force-confold` so your config files win, lists

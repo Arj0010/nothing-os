@@ -1,8 +1,9 @@
 #!/bin/bash
 # Update Linux Mint without losing local modifications.
 #
-#   ./bin/mint-update            # update, keeping every /etc file you changed
-#   ./bin/mint-update --dry-run  # show what would be upgraded, change nothing
+#   ./bin/mint-update                  # update, keeping every /etc file you changed
+#   ./bin/mint-update --dry-run        # show what would be upgraded, change nothing
+#   ./bin/mint-update --prune-kernels  # remove old kernels, keep running + 1 fallback
 #
 # Needs your sudo password. In a real terminal it asks there; with no controlling
 # terminal (an agent, a hotkey, a .desktop launcher) it pops a graphical prompt.
@@ -18,6 +19,7 @@ set -u
 R="$(cd "$(dirname "$0")/.." && pwd)"
 KEEP=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 DRY=""; [ "${1:-}" = "--dry-run" ] && DRY="--dry-run"
+PRUNE=""; [ "${1:-}" = "--prune-kernels" ] && PRUNE=1
 
 # Absolute paths on purpose. Mint installs a wrapper at /usr/local/bin/apt which
 # wins on PATH, accepts options only AFTER the command, and prints "apt does not
@@ -57,6 +59,52 @@ EOS
     exit 1
   fi
 fi
+
+prune_kernels() {
+  # `apt-get autoremove` will not touch these: a kernel that was ever installed
+  # explicitly is marked MANUAL, and autoremove only reaps automatic packages. On
+  # this machine that left 5 old kernels and ~845 MB sitting on a 90%-full disk.
+  #
+  # Keep exactly two: the running kernel, and the newest other one as a fallback in
+  # case an upgrade produces a kernel that will not boot.
+  local running keep_fallback versions doomed
+  running="$(uname -r | sed 's/-generic$//')"
+  versions="$(dpkg-query -W -f='${Package} ${Status}\n' 'linux-image-*-generic' 2>/dev/null \
+    | awk '$NF=="installed"{print $1}' | sed 's/^linux-image-//; s/-generic$//' \
+    | grep -E '^[0-9]' | sort -V)"
+  keep_fallback="$(echo "$versions" | grep -vx "$running" | tail -1)"
+
+  bold "kernels"
+  echo "  running  : $running   (keep)"
+  [ -n "$keep_fallback" ] && echo "  fallback : $keep_fallback   (keep)"
+  doomed="$(echo "$versions" | grep -vx "$running" | grep -vx "${keep_fallback:-__none__}")"
+  if [ -z "$doomed" ]; then grn "  nothing to prune."; return 0; fi
+  echo "  remove   : $(echo "$doomed" | tr '\n' ' ')"
+
+  # Expand each doomed version into every installed package that belongs to it.
+  local list; list="$(mktemp)"
+  for v in $doomed; do
+    dpkg-query -W -f='${Package} ${Status}\n' \
+      "linux-image-$v-generic" "linux-modules-$v-generic" \
+      "linux-modules-extra-$v-generic" "linux-headers-$v-generic" \
+      "linux-headers-$v" "linux-tools-$v-generic" "linux-tools-$v" 2>/dev/null \
+      | awk '$NF=="installed"{print $1}'
+  done | sort -u > "$list"
+
+  # Refuse to proceed if the running kernel somehow made it into the list.
+  if grep -q -- "$running" "$list"; then
+    red "  refusing: the running kernel appeared in the removal list"; rm -f "$list"; return 1
+  fi
+  echo "  $(wc -l < "$list") package(s)"
+  # xargs, not "$(cat list)": under zsh an unquoted multi-line variable is passed
+  # as ONE argument and apt reports "couldn't find any package by glob".
+  xargs -a "$list" "${SUDO[@]}" "$APTGET" -y purge || { red "purge failed"; rm -f "$list"; return 1; }
+  rm -f "$list"
+  "${SUDO[@]}" /usr/sbin/update-grub 2>/dev/null | tail -2
+  grn "done. free space now: $(df -h / | awk 'NR==2{print $4}')"
+}
+
+if [ -n "$PRUNE" ]; then prune_kernels; exit $?; fi
 
 bold "== 1/5  baseline =="
 # Record current state first, so drift is measurable afterwards. Skipped on a
