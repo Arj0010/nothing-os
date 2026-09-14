@@ -255,6 +255,12 @@ WATCHED = {
                             os.path.join(HOME, ".config/conky/nothing/bg.conf")]),
 }
 
+_DETACHED_PROCS = []
+
+def _reap_detached():
+    _DETACHED_PROCS[:] = [process for process in _DETACHED_PROCS
+                           if process.poll() is None]
+
 def _spawn(cmd):
     """Launch detached and never wait.
 
@@ -263,9 +269,12 @@ def _spawn(cmd):
     perfectly well. start_new_session detaches it so it survives this process.
     """
     try:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        _reap_detached()
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        _DETACHED_PROCS.append(process)
         return True
     except Exception:
         return False
@@ -341,8 +350,9 @@ def on_ac():
                 continue
             p = os.path.join("/sys/class/power_supply", name, "online")
             try:
-                if open(p).read().strip() == "1":
-                    return True
+                with open(p) as fh:
+                    if fh.read().strip() == "1":
+                        return True
             except OSError:
                 pass
     except OSError:
@@ -353,10 +363,11 @@ def cpu_mhz():
     """Highest current core clock, in MHz — the visible effect of the profile."""
     best = 0.0
     try:
-        for ln in open("/proc/cpuinfo"):
-            if ln.startswith("cpu MHz"):
-                try: best = max(best, float(ln.split(":")[1]))
-                except (IndexError, ValueError): pass
+        with open("/proc/cpuinfo") as fh:
+            for ln in fh:
+                if ln.startswith("cpu MHz"):
+                    try: best = max(best, float(ln.split(":")[1]))
+                    except (IndexError, ValueError): pass
     except OSError:
         pass
     return int(best)

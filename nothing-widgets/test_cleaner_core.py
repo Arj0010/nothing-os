@@ -5,6 +5,7 @@ Run:  python3 nothing-widgets/test_cleaner_core.py
 Stdlib only, no display needed.
 """
 import json, os, shutil, sys, tempfile, time, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cleaner_core as cc
@@ -262,6 +263,30 @@ class AliveTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_spawn_retains_detached_handle_until_it_exits(self):
+        class FakeProcess:
+            def __init__(self):
+                self.exited = False
+
+            def poll(self):
+                return 0 if self.exited else None
+
+        process = FakeProcess()
+        saved = list(cc._DETACHED_PROCS) if hasattr(cc, "_DETACHED_PROCS") else None
+        try:
+            cc._DETACHED_PROCS = []
+            with mock.patch.object(cc.subprocess, "Popen", return_value=process):
+                self.assertTrue(cc._spawn(["daemon"]))
+            self.assertIn(process, cc._DETACHED_PROCS)
+            process.exited = True
+            cc._reap_detached()
+            self.assertNotIn(process, cc._DETACHED_PROCS)
+        finally:
+            if saved is None:
+                del cc._DETACHED_PROCS
+            else:
+                cc._DETACHED_PROCS[:] = saved
+
 
 class PowerTest(unittest.TestCase):
     """The PERF switch drives power-profiles-daemon rather than sysfs, because PPD
@@ -289,6 +314,15 @@ class PowerTest(unittest.TestCase):
         m = cc.cpu_mhz()
         self.assertGreater(m, 100)
         self.assertLess(m, 10000)
+
+    def test_power_readers_do_not_leak_file_handles(self):
+        import gc
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ResourceWarning)
+            cc.on_ac()
+            cc.cpu_mhz()
+            gc.collect()
 
     def test_setting_the_profile_round_trips(self):
         """Skipped when PPD is absent. Restores whatever was selected."""
@@ -351,9 +385,14 @@ class TargetsTest(unittest.TestCase):
             # step away" — but that size must not reach the advertised total.
             self.assertGreater(rows["apt"]["bytes"], 0)
             total = cc.reclaimable(list(rows.values()))
-            self.assertLess(total, rows["apt"]["bytes"])
-            self.assertEqual(total, sum(r["bytes"] for r in rows.values()
-                                        if r["state"] == "ok" and not r["held"]))
+            expected = sum(
+                row["bytes"]
+                for row in rows.values()
+                if row["state"] == "ok" and not row["held"]
+            )
+            self.assertEqual(total, expected)
+            self.assertNotIn("apt", cc.auto_keys(list(rows.values())))
+            self.assertNotIn("journal", cc.auto_keys(list(rows.values())))
         finally:
             cc.SUDOERS_RULE = saved
 
