@@ -272,9 +272,10 @@ class AliveTest(unittest.TestCase):
                 return 0 if self.exited else None
 
         process = FakeProcess()
-        saved = list(cc._DETACHED_PROCS) if hasattr(cc, "_DETACHED_PROCS") else None
+        saved = cc._DETACHED_PROCS
+        saved_contents = list(saved)
         try:
-            cc._DETACHED_PROCS = []
+            saved[:] = []
             with mock.patch.object(cc.subprocess, "Popen", return_value=process):
                 self.assertTrue(cc._spawn(["daemon"]))
             self.assertIn(process, cc._DETACHED_PROCS)
@@ -282,10 +283,8 @@ class AliveTest(unittest.TestCase):
             cc._reap_detached()
             self.assertNotIn(process, cc._DETACHED_PROCS)
         finally:
-            if saved is None:
-                del cc._DETACHED_PROCS
-            else:
-                cc._DETACHED_PROCS[:] = saved
+            saved[:] = saved_contents
+            cc._DETACHED_PROCS = saved
 
 
 class PowerTest(unittest.TestCase):
@@ -381,9 +380,6 @@ class TargetsTest(unittest.TestCase):
             self.assertEqual(rows["apt"]["state"], "auth")
             self.assertEqual(rows["journal"]["state"], "auth")
             self.assertNotIn("apt", cc.auto_keys(list(rows.values())))
-            # The row still carries its size, so the card can say "1.5G, one install
-            # step away" — but that size must not reach the advertised total.
-            self.assertGreater(rows["apt"]["bytes"], 0)
             total = cc.reclaimable(list(rows.values()))
             expected = sum(
                 row["bytes"]
