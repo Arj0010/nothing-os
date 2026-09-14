@@ -59,10 +59,11 @@ must stage only optimizer/cleaner hunks and new files, leaving desktop layout,
 panel, Vicinae, Speed Test, and Now Playing work untouched.
 
 The cleaner tests currently run 57 cases with one failing assertion in
-`test_root_rows_report_auth_when_the_rule_is_absent` and two resource warnings from
-unclosed read handles. The failure compares all safe reclaimable bytes to the size
-of a single locked target, which is not a valid invariant. These baseline defects
-will be corrected as part of the touched cleaner surface.
+`test_root_rows_report_auth_when_the_rule_is_absent`, a warning from the detached
+daemon spawn, and unclosed read-handle warnings. The failure compares all safe
+reclaimable bytes to the size of a single locked target, which is not a valid
+invariant. These baseline defects will be corrected as part of the touched cleaner
+surface.
 
 ## Product model
 
