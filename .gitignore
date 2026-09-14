@@ -12,3 +12,7 @@ conky/wallpaper-*.png
 fonts/Ndot*.otf
 fonts/NType82*.otf
 fonts/LetteraMonoLL*.otf
+
+# Local agent and isolated-worktree scratch space
+.superpowers/
+.worktrees/
