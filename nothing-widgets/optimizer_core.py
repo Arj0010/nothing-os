@@ -49,6 +49,7 @@ class ProcessInfo:
     exe: str
     cgroup: str
     rss_bytes: int = 0
+    cmdline: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,10 @@ PROTECTED_EXECUTABLES = frozenset((
     "pipewire", "wireplumber", "NetworkManager", "dbus-daemon",
     "nothing-widgets.py", "optimizer_guard.py",
 ))
+PROTECTED_PYTHON_SCRIPTS = frozenset((
+    "nothing-widgets.py",
+    "optimizer_guard.py",
+))
 
 
 def _parse_stat(raw):
@@ -258,6 +263,18 @@ def _read_comm(comm_path):
         return ""
 
 
+def _read_cmdline(cmdline_path):
+    try:
+        with open(cmdline_path, "rb") as fh:
+            return tuple(
+                os.fsdecode(argument)
+                for argument in fh.read().split(b"\0")
+                if argument
+            )
+    except OSError:
+        return ()
+
+
 def read_processes(proc_root="/proc", uid=os.getuid()) -> Tuple[ProcessInfo, ...]:
     """Read only verifiably current-user processes from a procfs tree."""
     processes = []
@@ -292,6 +309,7 @@ def read_processes(proc_root="/proc", uid=os.getuid()) -> Tuple[ProcessInfo, ...
             exe=exe,
             cgroup=_read_cgroup(os.path.join(process_dir, "cgroup")),
             rss_bytes=_read_rss_bytes(os.path.join(process_dir, "statm")),
+            cmdline=_read_cmdline(os.path.join(process_dir, "cmdline")),
         ))
     return tuple(processes)
 
@@ -332,6 +350,27 @@ def _executable_name(process):
     return os.path.basename(process.exe)
 
 
+def _is_protected_python_script(process):
+    executable = _executable_name(process)
+    if not executable.startswith(("python", "pypy")):
+        return False
+    for argument in process.cmdline[1:]:
+        if argument.startswith("-"):
+            continue
+        return (
+            os.path.isabs(argument)
+            and os.path.basename(argument) in PROTECTED_PYTHON_SCRIPTS
+        )
+    return False
+
+
+def _is_protected(process):
+    return (
+        _executable_name(process) in PROTECTED_EXECUTABLES
+        or _is_protected_python_script(process)
+    )
+
+
 def _has_stable_identity(process):
     return process.identity.pid > 0 and process.identity.start_time > 0
 
@@ -354,8 +393,7 @@ def _key_for_cgroup(cgroup):
 
 
 def _label_and_role(processes):
-    names = {_executable_name(process) for process in processes}
-    if names & PROTECTED_EXECUTABLES:
+    if any(_is_protected(process) for process in processes):
         return "Protected service", Role.PROTECTED
     for process in processes:
         name = _executable_name(process)
@@ -368,8 +406,10 @@ def _label_and_role(processes):
     return _unit_for(processes[0].cgroup) or processes[0].comm or "Process", Role.BACKGROUND
 
 
-def _unmanaged_group(process, reason):
-    label, role = _label_and_role((process,))
+def _unmanaged_group(process, reason, role=None):
+    label, default_role = _label_and_role((process,))
+    if role is None:
+        role = default_role
     return AppGroup(
         key="process-%d-%d" % (process.identity.pid, process.identity.start_time),
         label=label,
@@ -380,24 +420,26 @@ def _unmanaged_group(process, reason):
     )
 
 
-def _agent_roots(processes):
+def _agent_groups(processes):
     by_pid = {process.identity.pid: process for process in processes}
     candidates = {
         process.identity.pid for process in processes
         if _executable_name(process) in AGENT_EXECUTABLES
     }
-    roots = []
-    for candidate in sorted(candidates):
-        parent = by_pid[candidate].ppid
+    members = {candidate: [] for candidate in candidates}
+    for process in processes:
+        parent = process.identity.pid
         ancestors = set()
         while parent in by_pid and parent not in ancestors:
             if parent in candidates:
+                members[parent].append(process)
                 break
             ancestors.add(parent)
             parent = by_pid[parent].ppid
-        else:
-            roots.append(candidate)
-    return tuple(roots)
+    return tuple(
+        (root_pid, tuple(members[root_pid]))
+        for root_pid in sorted(candidates)
+    )
 
 
 def classify_groups(processes, desktop_apps=(), capture=None, manual_primary="",
@@ -412,17 +454,22 @@ def classify_groups(processes, desktop_apps=(), capture=None, manual_primary="",
     groups = []
     assigned = set()
 
-    for root_pid in _agent_roots(stable):
-        member_pids = descendants(stable, (root_pid,))
-        members = tuple(
-            process for process in stable
-            if process.identity.pid in member_pids
-        )
+    for root_pid, members in _agent_groups(current):
         assigned.update(process.identity for process in members)
         root = next(process for process in members if process.identity.pid == root_pid)
-        role = (Role.PROTECTED if any(
-            _executable_name(process) in PROTECTED_EXECUTABLES for process in members
-        ) else Role.PRIMARY)
+        if not all(
+            _has_stable_identity(process) and _has_stable_cgroup(process)
+            for process in members
+        ):
+            for process in members:
+                role = Role.PROTECTED if _is_protected(process) else Role.PRIMARY
+                groups.append(_unmanaged_group(
+                    process,
+                    "agent tree has unresolved cgroup",
+                    role=role,
+                ))
+            continue
+        role = Role.PROTECTED if any(_is_protected(process) for process in members) else Role.PRIMARY
         agent_name = _executable_name(root).title()
         groups.append(AppGroup(
             key="agent-%d-%d" % (root.identity.pid, root.identity.start_time),
@@ -434,7 +481,7 @@ def classify_groups(processes, desktop_apps=(), capture=None, manual_primary="",
         ))
 
     for process in current:
-        if not _has_stable_identity(process):
+        if not _has_stable_identity(process) and process.identity not in assigned:
             groups.append(_unmanaged_group(process, "unresolved process identity"))
             assigned.add(process.identity)
 

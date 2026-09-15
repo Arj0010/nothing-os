@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import optimizer_core as oc
 
 
-def proc(pid, ppid, comm, exe, cgroup, uid=1000, start=None):
-    return oc.ProcessInfo(
+def proc(pid, ppid, comm, exe, cgroup, uid=1000, start=None, cmdline=()):
+    fields = dict(
         identity=oc.ProcessIdentity(pid, start if start is not None else pid * 100),
         ppid=ppid,
         uid=uid,
@@ -18,6 +18,9 @@ def proc(pid, ppid, comm, exe, cgroup, uid=1000, start=None):
         exe=exe,
         cgroup=cgroup,
     )
+    if cmdline:
+        fields["cmdline"] = cmdline
+    return oc.ProcessInfo(**fields)
 
 
 class FakeProcessSource:
@@ -157,7 +160,8 @@ class DiscoveryTest(unittest.TestCase):
             proc(61, 1, "vlc", "/usr/bin/vlc", "/user/app/vlc", self.uid),
             proc(62, 1, "telegram", "/usr/bin/telegram-desktop", "/user/app/telegram", self.uid),
             proc(63, 1, "pipewire", "/usr/bin/pipewire", "/user/service/pipewire", self.uid),
-            proc(64, 1, "guard", "/opt/nothing/optimizer_guard.py", "/user/app/guard", self.uid),
+            proc(64, 1, "python", "/usr/bin/python3", "/user/app/guard", self.uid,
+                 cmdline=("/usr/bin/python3", "/opt/nothing/optimizer_guard.py")),
         )
         roles_by_pid = {
             process.identity.pid: group.role
@@ -169,6 +173,65 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(roles_by_pid[62], oc.Role.MEDIA)
         self.assertEqual(roles_by_pid[63], oc.Role.PROTECTED)
         self.assertEqual(roles_by_pid[64], oc.Role.PROTECTED)
+
+    def test_python_launched_widget_script_is_protected_by_cmdline_path(self):
+        rows = (
+            proc(65, 1, "python", "/usr/bin/python3", "/user/app/widget", self.uid,
+                 cmdline=("/usr/bin/python3", "/opt/nothing/nothing-widgets.py")),
+        )
+        group = oc.classify_groups(rows, uid=self.uid)[0]
+        self.assertEqual(group.role, oc.Role.PROTECTED)
+
+    def test_agent_tree_with_uncertain_descendant_cgroup_is_unmanaged_singletons(self):
+        rows = (
+            proc(80, 1, "claude", "/usr/bin/claude", "/user/app/term", self.uid),
+            proc(81, 80, "python", "/usr/bin/python3", "", self.uid),
+            proc(82, 81, "java", "/usr/bin/java", "/user/app/term", self.uid),
+        )
+        groups = oc.classify_groups(rows, uid=self.uid)
+        agent_groups = [
+            group for group in groups
+            if any(process.identity.pid in {80, 81, 82} for process in group.processes)
+        ]
+        self.assertTrue(all(group.role == oc.Role.PRIMARY for group in agent_groups))
+        self.assertTrue(all(not group.managed for group in agent_groups))
+        self.assertEqual(
+            [{process.identity.pid for process in group.processes} for group in agent_groups],
+            [{80}, {81}, {82}],
+        )
+
+    def test_agent_tree_with_uncertain_descendant_identity_is_unmanaged_singletons(self):
+        rows = (
+            proc(83, 1, "codex", "/usr/bin/codex", "/user/app/term", self.uid),
+            proc(84, 83, "python", "/usr/bin/python3", "/user/app/term", self.uid, start=0),
+            proc(85, 84, "java", "/usr/bin/java", "/user/app/term", self.uid),
+        )
+        groups = oc.classify_groups(rows, uid=self.uid)
+        agent_groups = [
+            group for group in groups
+            if any(process.identity.pid in {83, 84, 85} for process in group.processes)
+        ]
+        self.assertTrue(all(group.role == oc.Role.PRIMARY for group in agent_groups))
+        self.assertTrue(all(not group.managed for group in agent_groups))
+        self.assertEqual(
+            [{process.identity.pid for process in group.processes} for group in agent_groups],
+            [{83}, {84}, {85}],
+        )
+
+    def test_nested_agent_roots_are_separate_and_own_closest_descendants(self):
+        rows = (
+            proc(100, 1, "claude", "/usr/bin/claude", "/user/app/outer", self.uid),
+            proc(101, 100, "python", "/usr/bin/python3", "/user/app/outer", self.uid),
+            proc(102, 101, "codex", "/usr/bin/codex", "/user/app/inner", self.uid),
+            proc(103, 102, "java", "/usr/bin/java", "/user/app/inner", self.uid),
+            proc(104, 101, "ruby", "/usr/bin/ruby", "/user/app/outer", self.uid),
+        )
+        groups = oc.classify_groups(rows, uid=self.uid)
+        agent_groups = [group for group in groups if group.role == oc.Role.PRIMARY]
+        self.assertEqual(
+            [{process.identity.pid for process in group.processes} for group in agent_groups],
+            [{100, 101, 104}, {102, 103}],
+        )
 
     def test_missing_cgroup_is_an_unmanaged_singleton(self):
         rows = (
@@ -237,7 +300,23 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(process.cgroup, "/user/app/python")
         self.assertEqual(process.rss_bytes, 17 * os.sysconf("SC_PAGE_SIZE"))
 
-    def _write_proc_fixture(self, root, pid, comm, ppid, start_time, uid, exe, cgroup, rss_pages):
+    def test_read_processes_keeps_python_script_path_from_cmdline(self):
+        with tempfile.TemporaryDirectory() as proc_root:
+            self._write_proc_fixture(
+                proc_root, 105, "python", 1, 12346, self.uid, "/usr/bin/python3",
+                "/user/app/widget", 17,
+                cmdline=("/usr/bin/python3", "/opt/nothing/nothing-widgets.py"),
+            )
+            processes = oc.read_processes(proc_root=proc_root, uid=self.uid)
+
+        self.assertEqual(
+            processes[0].cmdline,
+            ("/usr/bin/python3", "/opt/nothing/nothing-widgets.py"),
+        )
+        self.assertEqual(oc.classify_groups(processes, uid=self.uid)[0].role, oc.Role.PROTECTED)
+
+    def _write_proc_fixture(self, root, pid, comm, ppid, start_time, uid, exe, cgroup, rss_pages,
+                            cmdline=()):
         directory = os.path.join(root, str(pid))
         os.mkdir(directory)
         fields = ["R", str(ppid)] + ["0"] * 17 + [str(start_time)]
@@ -252,3 +331,6 @@ class DiscoveryTest(unittest.TestCase):
             fh.write("100 %d 0 0 0 0 0\n" % rss_pages)
         with open(os.path.join(directory, "comm"), "w", encoding="utf-8") as fh:
             fh.write("display-only\n")
+        if cmdline:
+            with open(os.path.join(directory, "cmdline"), "wb") as fh:
+                fh.write(b"\0".join(arg.encode("utf-8") for arg in cmdline) + b"\0")
