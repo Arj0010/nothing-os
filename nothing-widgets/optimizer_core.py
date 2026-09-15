@@ -628,6 +628,13 @@ def _is_brave_identity(properties):
     return False
 
 
+def _has_application_identity(properties):
+    return any(
+        isinstance(properties.get(name), str) and bool(properties[name].strip())
+        for name in ("application.process.binary", "application.name")
+    )
+
+
 def _pactl_capture_state(output):
     records = json.loads(output)
     if isinstance(records, dict):
@@ -643,7 +650,7 @@ def _pactl_capture_state(output):
     return CaptureState(
         active=bool(properties),
         brave=any(_is_brave_identity(value) for value in properties),
-        certain=True,
+        certain=all(_has_application_identity(value) for value in properties),
     )
 
 
@@ -665,7 +672,7 @@ def _pipewire_capture_state(output):
     return CaptureState(
         active=bool(captures),
         brave=any(_is_brave_identity(properties) for properties in captures),
-        certain=True,
+        certain=all(_has_application_identity(properties) for properties in captures),
     )
 
 
@@ -702,14 +709,22 @@ def promote_capture(groups, state) -> Tuple[AppGroup, ...]:
 
 def detect_capabilities(runner) -> Tuple[Capability, ...]:
     """Report only capabilities that probes can establish without blocking callers."""
-    helper_ok, _helper_output = _run_probe(
+    helper_ok, helper_output = _run_probe(
         runner, ("nothing-optimizer-helper", "--capabilities")
     )
     power_ok, _power_output = _run_probe(runner, ("powerprofilesctl", "get"))
+    try:
+        helper_capabilities = json.loads(helper_output)
+        network_rules_active = (
+            isinstance(helper_capabilities, dict)
+            and helper_capabilities.get("network_rules_active") is True
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        network_rules_active = False
     network = (
         Capability("network", "full", "Privileged network helper is available")
-        if helper_ok else
-        Capability("network", "fallback", "BASIC network policy only; helper unavailable")
+        if helper_ok and network_rules_active else
+        Capability("network", "fallback", "BASIC network policy only; active helper rules unverified")
     )
     power = (
         Capability("power", "full", "power-profiles service is available")

@@ -104,6 +104,37 @@ class CaptureTest(unittest.TestCase):
             oc.CaptureState(active=True, brave=True, certain=True),
         )
 
+    def test_pactl_capture_without_identity_is_uncertain_and_protects_brave(self):
+        runner = FakeRunner({
+            ("pactl", "-f", "json", "list", "source-outputs"): """
+                [{"properties": {}}]
+            """,
+        })
+        state = oc.capture_state(runner)
+        self.assertEqual(
+            state,
+            oc.CaptureState(active=True, brave=False, certain=False),
+        )
+        self.assertEqual(oc.promote_capture(brave_groups(), state)[0].role, oc.Role.MEETING)
+
+    def test_pipewire_capture_without_identity_is_uncertain_and_protects_brave(self):
+        runner = FakeRunner(
+            {
+                ("pw-dump",): """
+                    [{"info": {"props": {
+                        "media.class": "Stream/Input/Audio"
+                    }}}]
+                """,
+            },
+            fail={"pactl"},
+        )
+        state = oc.capture_state(runner)
+        self.assertEqual(
+            state,
+            oc.CaptureState(active=True, brave=False, certain=False),
+        )
+        self.assertEqual(oc.promote_capture(brave_groups(), state)[0].role, oc.Role.MEETING)
+
     def test_failed_capture_probes_are_uncertain_and_inactive(self):
         self.assertEqual(
             oc.capture_state(FakeRunner(fail={"pactl", "pw-dump"})),
@@ -121,6 +152,29 @@ class CapabilityTest(unittest.TestCase):
         }
         self.assertEqual(caps["network"].level, "fallback")
         self.assertIn("basic", caps["network"].detail.lower())
+
+    def test_network_requires_typed_active_rule_proof(self):
+        command = ("nothing-optimizer-helper", "--capabilities")
+        for output in ("", '{"network_rules_active": false}', "[]"):
+            with self.subTest(output=output):
+                caps = {
+                    cap.name: cap
+                    for cap in oc.detect_capabilities(
+                        FakeRunner({command: output})
+                    )
+                }
+                self.assertEqual(caps["network"].level, "fallback")
+                self.assertIn("basic", caps["network"].detail.lower())
+
+    def test_network_full_requires_typed_active_rule_proof(self):
+        caps = {
+            cap.name: cap
+            for cap in oc.detect_capabilities(FakeRunner({
+                ("nothing-optimizer-helper", "--capabilities"):
+                    '{"network_rules_active": true}',
+            }))
+        }
+        self.assertEqual(caps["network"].level, "full")
 
     def test_power_failure_is_reported_not_raised(self):
         caps = {
