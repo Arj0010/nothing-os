@@ -209,6 +209,39 @@ PROTECTED_PYTHON_SCRIPTS = frozenset((
     "nothing-widgets.py",
     "optimizer_guard.py",
 ))
+PYTHON_OPTIONS_WITH_ARGUMENT = frozenset((
+    "-W",
+    "-X",
+    "--check-hash-based",
+))
+PYTHON_OPTIONS_WITHOUT_SCRIPT = frozenset((
+    "-c",
+    "-m",
+    "--help",
+    "--help-all",
+    "--help-env",
+    "--help-xoptions",
+    "--version",
+))
+PYTHON_OPTIONS_WITHOUT_ARGUMENT = frozenset((
+    "-b",
+    "-B",
+    "-d",
+    "-E",
+    "-h",
+    "-i",
+    "-I",
+    "-O",
+    "-OO",
+    "-P",
+    "-q",
+    "-s",
+    "-S",
+    "-u",
+    "-v",
+    "-V",
+    "-x",
+))
 
 
 def _parse_stat(raw):
@@ -350,18 +383,52 @@ def _executable_name(process):
     return os.path.basename(process.exe)
 
 
-def _is_protected_python_script(process):
+def _python_script_path(process):
     executable = _executable_name(process)
     if not executable.startswith(("python", "pypy")):
-        return False
-    for argument in process.cmdline[1:]:
-        if argument.startswith("-"):
+        return "", False
+    index = 1
+    while index < len(process.cmdline):
+        argument = process.cmdline[index]
+        if argument == "--":
+            index += 1
+            return (
+                (process.cmdline[index], False)
+                if index < len(process.cmdline) else ("", True)
+            )
+        if argument in PYTHON_OPTIONS_WITHOUT_SCRIPT:
+            return "", False
+        if argument in PYTHON_OPTIONS_WITH_ARGUMENT:
+            if index + 1 >= len(process.cmdline):
+                return "", True
+            index += 2
             continue
-        return (
-            os.path.isabs(argument)
-            and os.path.basename(argument) in PROTECTED_PYTHON_SCRIPTS
-        )
-    return False
+        if argument.startswith(("-W", "-X")) and len(argument) > 2:
+            index += 1
+            continue
+        if argument.startswith("--check-hash-based="):
+            index += 1
+            continue
+        if argument in PYTHON_OPTIONS_WITHOUT_ARGUMENT:
+            index += 1
+            continue
+        if argument.startswith("-"):
+            return "", True
+        return argument, False
+    return "", False
+
+
+def _is_protected_python_script(process):
+    script_path, _ambiguous = _python_script_path(process)
+    return (
+        os.path.isabs(script_path)
+        and os.path.basename(script_path) in PROTECTED_PYTHON_SCRIPTS
+    )
+
+
+def _is_ambiguous_python_invocation(process):
+    _script_path, ambiguous = _python_script_path(process)
+    return ambiguous
 
 
 def _is_protected(process):
@@ -377,6 +444,17 @@ def _has_stable_identity(process):
 
 def _has_stable_cgroup(process):
     return bool(process.cgroup and process.cgroup.strip() not in ("", "/"))
+
+
+def _agent_uncertainty_reason(processes):
+    reasons = []
+    if any(not _has_stable_identity(process) for process in processes):
+        reasons.append("unresolved identity")
+    if any(not _has_stable_cgroup(process) for process in processes):
+        reasons.append("unresolved cgroup")
+    if any(_is_ambiguous_python_invocation(process) for process in processes):
+        reasons.append("ambiguous Python invocation")
+    return "agent tree has " + " and ".join(reasons)
 
 
 def _unit_for(cgroup):
@@ -458,14 +536,17 @@ def classify_groups(processes, desktop_apps=(), capture=None, manual_primary="",
         assigned.update(process.identity for process in members)
         root = next(process for process in members if process.identity.pid == root_pid)
         if not all(
-            _has_stable_identity(process) and _has_stable_cgroup(process)
+            _has_stable_identity(process)
+            and _has_stable_cgroup(process)
+            and not _is_ambiguous_python_invocation(process)
             for process in members
         ):
+            reason = _agent_uncertainty_reason(members)
             for process in members:
                 role = Role.PROTECTED if _is_protected(process) else Role.PRIMARY
                 groups.append(_unmanaged_group(
                     process,
-                    "agent tree has unresolved cgroup",
+                    reason,
                     role=role,
                 ))
             continue
@@ -488,10 +569,15 @@ def classify_groups(processes, desktop_apps=(), capture=None, manual_primary="",
     pending = tuple(process for process in stable if process.identity not in assigned)
     by_cgroup = {}
     for process in pending:
-        if _has_stable_cgroup(process):
+        if _has_stable_cgroup(process) and not _is_ambiguous_python_invocation(process):
             by_cgroup.setdefault(process.cgroup, []).append(process)
         else:
-            groups.append(_unmanaged_group(process, "missing stable cgroup"))
+            reason = (
+                "ambiguous Python invocation"
+                if _is_ambiguous_python_invocation(process)
+                else "missing stable cgroup"
+            )
+            groups.append(_unmanaged_group(process, reason))
 
     used_keys = {group.key for group in groups}
     for cgroup, members in sorted(by_cgroup.items(), key=lambda item: item[1][0].identity.pid):

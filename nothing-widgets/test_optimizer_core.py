@@ -182,6 +182,34 @@ class DiscoveryTest(unittest.TestCase):
         group = oc.classify_groups(rows, uid=self.uid)[0]
         self.assertEqual(group.role, oc.Role.PROTECTED)
 
+    def test_python_option_arguments_do_not_hide_protected_widget_script(self):
+        rows = (
+            proc(
+                66, 1, "python", "/usr/bin/python3", "/user/app/widget", self.uid,
+                cmdline=(
+                    "/usr/bin/python3", "-W", "ignore", "-X", "dev",
+                    "/opt/nothing/nothing-widgets.py",
+                ),
+            ),
+        )
+        group = oc.classify_groups(rows, uid=self.uid)[0]
+        self.assertEqual(group.role, oc.Role.PROTECTED)
+        self.assertTrue(group.managed)
+
+    def test_ambiguous_python_invocation_is_not_a_managed_background_target(self):
+        rows = (
+            proc(
+                67, 1, "python", "/usr/bin/python3", "/user/app/widget", self.uid,
+                cmdline=(
+                    "/usr/bin/python3", "--unknown-option", "value",
+                    "/opt/nothing/nothing-widgets.py",
+                ),
+            ),
+        )
+        group = oc.classify_groups(rows, uid=self.uid)[0]
+        self.assertFalse(group.managed)
+        self.assertEqual(group.role, oc.Role.BACKGROUND)
+
     def test_agent_tree_with_uncertain_descendant_cgroup_is_unmanaged_singletons(self):
         rows = (
             proc(80, 1, "claude", "/usr/bin/claude", "/user/app/term", self.uid),
@@ -195,6 +223,8 @@ class DiscoveryTest(unittest.TestCase):
         ]
         self.assertTrue(all(group.role == oc.Role.PRIMARY for group in agent_groups))
         self.assertTrue(all(not group.managed for group in agent_groups))
+        self.assertTrue(all(group.reason == "agent tree has unresolved cgroup"
+                            for group in agent_groups))
         self.assertEqual(
             [{process.identity.pid for process in group.processes} for group in agent_groups],
             [{80}, {81}, {82}],
@@ -213,6 +243,8 @@ class DiscoveryTest(unittest.TestCase):
         ]
         self.assertTrue(all(group.role == oc.Role.PRIMARY for group in agent_groups))
         self.assertTrue(all(not group.managed for group in agent_groups))
+        self.assertTrue(all(group.reason == "agent tree has unresolved identity"
+                            for group in agent_groups))
         self.assertEqual(
             [{process.identity.pid for process in group.processes} for group in agent_groups],
             [{83}, {84}, {85}],
