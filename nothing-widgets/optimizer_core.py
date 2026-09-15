@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Display-independent domain models and policies for AGENT WORK."""
+import dataclasses
 import json
 import os
 import tempfile
@@ -79,6 +80,13 @@ class Capability:
     name: str
     level: str
     detail: str
+
+
+@dataclass(frozen=True)
+class CaptureState:
+    active: bool
+    brave: bool
+    certain: bool
 
 
 @dataclass(frozen=True)
@@ -598,3 +606,114 @@ def classify_groups(processes, desktop_apps=(), capture=None, manual_primary="",
             reason="stable cgroup",
         ))
     return tuple(groups)
+
+
+def _run_probe(runner, command):
+    """Run an injected read-only probe and normalize a failed result."""
+    try:
+        result = runner(command) if callable(runner) else runner.run(command)
+        if not isinstance(result, tuple) or len(result) < 2:
+            return False, ""
+        return bool(result[0]), str(result[1] or "")
+    except Exception:
+        return False, ""
+
+
+def _is_brave_identity(properties):
+    """Match only application identity fields, never stream or device metadata."""
+    for name in ("application.process.binary", "application.name"):
+        value = properties.get(name, "")
+        if isinstance(value, str) and "brave" in value.casefold():
+            return True
+    return False
+
+
+def _pactl_capture_state(output):
+    records = json.loads(output)
+    if isinstance(records, dict):
+        records = records.get("source-outputs", list(records.values()))
+    if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+        raise ValueError("invalid source-output metadata")
+    properties = []
+    for record in records:
+        value = record.get("properties", {})
+        if not isinstance(value, dict):
+            raise ValueError("invalid source-output properties")
+        properties.append(value)
+    return CaptureState(
+        active=bool(properties),
+        brave=any(_is_brave_identity(value) for value in properties),
+        certain=True,
+    )
+
+
+def _pipewire_capture_state(output):
+    nodes = json.loads(output)
+    if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
+        raise ValueError("invalid PipeWire metadata")
+    captures = []
+    for node in nodes:
+        info = node.get("info", {})
+        if not isinstance(info, dict):
+            continue
+        properties = info.get("props", {})
+        if not isinstance(properties, dict):
+            continue
+        media_class = properties.get("media.class", "")
+        if isinstance(media_class, str) and media_class.startswith("Stream/Input/"):
+            captures.append(properties)
+    return CaptureState(
+        active=bool(captures),
+        brave=any(_is_brave_identity(properties) for properties in captures),
+        certain=True,
+    )
+
+
+def capture_state(runner) -> CaptureState:
+    """Read capture activity from server metadata without inspecting media content."""
+    ok, output = _run_probe(runner, ("pactl", "-f", "json", "list", "source-outputs"))
+    if ok:
+        try:
+            return _pactl_capture_state(output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    ok, output = _run_probe(runner, ("pw-dump",))
+    if ok:
+        try:
+            return _pipewire_capture_state(output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return CaptureState(active=False, brave=False, certain=False)
+
+
+def promote_capture(groups, state) -> Tuple[AppGroup, ...]:
+    """Promote Brave while capture is attributed or uncertain and active."""
+    result = []
+    for group in groups:
+        role = group.role
+        is_brave = group.key.startswith("brave")
+        if is_brave and state.active and (state.brave or not state.certain):
+            role = Role.MEETING
+        elif is_brave and ROLE_STRENGTH[role] < ROLE_STRENGTH[Role.INTERACTIVE]:
+            role = Role.INTERACTIVE
+        result.append(dataclasses.replace(group, role=role))
+    return tuple(result)
+
+
+def detect_capabilities(runner) -> Tuple[Capability, ...]:
+    """Report only capabilities that probes can establish without blocking callers."""
+    helper_ok, _helper_output = _run_probe(
+        runner, ("nothing-optimizer-helper", "--capabilities")
+    )
+    power_ok, _power_output = _run_probe(runner, ("powerprofilesctl", "get"))
+    network = (
+        Capability("network", "full", "Privileged network helper is available")
+        if helper_ok else
+        Capability("network", "fallback", "BASIC network policy only; helper unavailable")
+    )
+    power = (
+        Capability("power", "full", "power-profiles service is available")
+        if power_ok else
+        Capability("power", "unavailable", "power-profiles service is unavailable")
+    )
+    return network, power

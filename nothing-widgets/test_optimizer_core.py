@@ -45,6 +45,95 @@ def brave_groups():
     )
 
 
+class FakeRunner:
+    """Controlled command runner for metadata and capability probes."""
+
+    def __init__(self, responses=None, missing=(), fail=()):
+        self.responses = responses or {}
+        self.missing = set(missing)
+        self.fail = set(fail)
+
+    def __call__(self, command):
+        executable = command[0]
+        if executable in self.missing or executable in self.fail:
+            return False, ""
+        return True, self.responses.get(tuple(command), "")
+
+
+class CaptureTest(unittest.TestCase):
+    def test_attributed_brave_capture_promotes_brave(self):
+        state = oc.CaptureState(active=True, brave=True, certain=True)
+        groups = oc.promote_capture(brave_groups(), state)
+        self.assertEqual(groups[0].role, oc.Role.MEETING)
+
+    def test_uncertain_capture_fails_safe_when_brave_is_running(self):
+        state = oc.CaptureState(active=True, brave=False, certain=False)
+        groups = oc.promote_capture(brave_groups(), state)
+        self.assertEqual(groups[0].role, oc.Role.MEETING)
+
+    def test_probe_failure_never_demotes_brave_below_interactive(self):
+        state = oc.CaptureState(active=False, brave=False, certain=False)
+        groups = oc.promote_capture(brave_groups(), state)
+        self.assertEqual(groups[0].role, oc.Role.INTERACTIVE)
+
+    def test_pactl_metadata_attributes_brave_capture(self):
+        runner = FakeRunner({
+            ("pactl", "-f", "json", "list", "source-outputs"): """
+                [{"properties": {"application.process.binary": "brave-browser"}}]
+            """,
+        })
+        self.assertEqual(
+            oc.capture_state(runner),
+            oc.CaptureState(active=True, brave=True, certain=True),
+        )
+
+    def test_pactl_failure_falls_back_to_pipewire_metadata(self):
+        runner = FakeRunner(
+            {
+                ("pw-dump",): """
+                    [{"info": {"props": {
+                        "media.class": "Stream/Input/Audio",
+                        "application.name": "Brave"
+                    }}}]
+                """,
+            },
+            fail={"pactl"},
+        )
+        self.assertEqual(
+            oc.capture_state(runner),
+            oc.CaptureState(active=True, brave=True, certain=True),
+        )
+
+    def test_failed_capture_probes_are_uncertain_and_inactive(self):
+        self.assertEqual(
+            oc.capture_state(FakeRunner(fail={"pactl", "pw-dump"})),
+            oc.CaptureState(active=False, brave=False, certain=False),
+        )
+
+
+class CapabilityTest(unittest.TestCase):
+    def test_network_capability_is_basic_without_helper(self):
+        caps = {
+            cap.name: cap
+            for cap in oc.detect_capabilities(
+                FakeRunner(missing={"nothing-optimizer-helper"})
+            )
+        }
+        self.assertEqual(caps["network"].level, "fallback")
+        self.assertIn("basic", caps["network"].detail.lower())
+
+    def test_power_failure_is_reported_not_raised(self):
+        caps = {
+            cap.name: cap
+            for cap in oc.detect_capabilities(FakeRunner(fail={"powerprofilesctl"}))
+        }
+        self.assertEqual(caps["power"].level, "unavailable")
+
+    def test_capability_levels_are_limited_to_the_honest_contract(self):
+        caps = oc.detect_capabilities(FakeRunner())
+        self.assertTrue({cap.level for cap in caps} <= {"full", "fallback", "unavailable"})
+
+
 class PolicyTest(unittest.TestCase):
     def test_meeting_is_stronger_than_primary_and_interactive(self):
         self.assertGreater(oc.ROLE_STRENGTH[oc.Role.MEETING],
