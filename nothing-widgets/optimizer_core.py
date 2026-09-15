@@ -3,7 +3,12 @@
 import dataclasses
 import json
 import os
+import secrets
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Protocol, Tuple
@@ -97,6 +102,7 @@ class ActionResult:
     survived: int
     protected: bool = False
     detail: str = ""
+    end_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -781,18 +787,22 @@ class ResourceController:
     Failed restores remain pending for retry. External changes relinquish ownership.
     """
 
-    def __init__(self, runner, uid=os.getuid(), network=None, source=None):
+    def __init__(self, runner, uid=os.getuid(), network=None, source=None,
+                 journal=None, journal_path=None):
         self.runner = runner
         self.uid = uid
         self.network = network if network is not None else BasicNetworkBackend()
         self.source = source
+        self.journal = journal or RuntimeJournal(journal_path)
         self._profile_read = False
         self._profile_original = None
         self._profile_owned = None
         self._units = {}
         self._unit_pending = {}
         self._unit_identities = {}
+        self._unit_group_keys = {}
         self._processes = {}
+        self._process_group_keys = {}
 
     def _run(self, command):
         return _run_probe(self.runner, tuple(command))
@@ -860,6 +870,7 @@ class ResourceController:
         self._reconcile_unit(group.unit, after)
         if self._units.get(group.unit) or self._unit_pending.get(group.unit):
             self._unit_identities[group.unit] = identities
+            self._unit_group_keys[group.unit] = group.key
         else:
             self._forget_unit(group.unit)
         return succeeded
@@ -868,6 +879,7 @@ class ResourceController:
         self._units.pop(unit, None)
         self._unit_pending.pop(unit, None)
         self._unit_identities.pop(unit, None)
+        self._unit_group_keys.pop(unit, None)
 
     def _reconcile_unit(self, unit, current):
         """Resolve attempted writes and relinquish externally changed values."""
@@ -941,6 +953,7 @@ class ResourceController:
                     original = self._processes.get(key, (before, None))[0]
                     if before != wanted or key in self._processes:
                         self._processes[key] = (original, wanted)
+                        self._process_group_keys[key] = group.key
                     changed = True
             if changed:
                 applied.append(identity)
@@ -993,6 +1006,7 @@ class ResourceController:
             network = self.network.apply(tuple(eligible), policies)
         except Exception:
             network = Capability("network", "unavailable", "Network backend failed")
+        self._sync_runtime_journal()
         return AppliedState(mode, tuple(applied), (
             power, Capability("cpu_io", cpu_level, "User weights or safe process priorities"),
             Capability("memory", memory_level, "Soft memory protection only"), network))
@@ -1069,6 +1083,715 @@ class ResourceController:
         if self._profile_owned is None:
             self._profile_read = False
             self._profile_original = None
+        self._sync_runtime_journal()
         return tuple(Capability(name, "unavailable" if name in failures else "full",
                                 "Restore pending" if name in failures else "Restore complete")
                      for name in ("cpu_io", "memory", "power")) + (network,)
+
+    def _sync_runtime_journal(self):
+        """Persist only confirmed resource ownership needed after a crash."""
+        entries = []
+        for unit, properties in self._units.items():
+            identities = self._unit_identities.get(unit, ())
+            if not properties or not identities:
+                continue
+            entries.append({
+                "action": "resource",
+                "group_key": self._unit_group_keys.get(unit, unit),
+                "identities": [_identity_data(identity) for identity in identities],
+                "unit": unit,
+                "original": {name: original for name, (original, _owned) in properties.items()},
+                "owned": {name: owned for name, (_original, owned) in properties.items()},
+            })
+        process_entries = {}
+        for (identity, kind), (original, owned) in self._processes.items():
+            key = (identity, self._process_group_keys.get((identity, kind), "process"))
+            process_entries.setdefault(key, [{}, {}])[0][kind] = original
+            process_entries[key][1][kind] = owned
+        for (identity, group_key), (original, owned) in process_entries.items():
+            entries.append({
+                "action": "resource",
+                "group_key": group_key,
+                "identities": [_identity_data(identity)],
+                "unit": "",
+                "original": {
+                    name: list(value) if isinstance(value, tuple) else value
+                    for name, value in original.items()
+                },
+                "owned": {
+                    name: list(value) if isinstance(value, tuple) else value
+                    for name, value in owned.items()
+                },
+            })
+        self.journal.replace_action("resource", entries)
+
+
+RUNTIME_JOURNAL_VERSION = 1
+
+
+def runtime_journal_path():
+    """Return the owner-only runtime-state path without creating it."""
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home:
+        config_home = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(config_home, "nothing-widgets", "optimizer-runtime.json")
+
+
+def _empty_runtime_journal():
+    return {"version": RUNTIME_JOURNAL_VERSION, "entries": []}
+
+
+def _valid_identity_data(value):
+    return (
+        isinstance(value, dict)
+        and set(value) == {"pid", "start_time"}
+        and isinstance(value["pid"], int)
+        and not isinstance(value["pid"], bool)
+        and value["pid"] > 0
+        and isinstance(value["start_time"], int)
+        and not isinstance(value["start_time"], bool)
+        and value["start_time"] > 0
+    )
+
+
+def _valid_runtime_entry(value):
+    if not isinstance(value, dict) or set(value) != {
+            "action", "group_key", "identities", "unit", "original", "owned"}:
+        return False
+    if value["action"] not in ("pause", "resource"):
+        return False
+    if not isinstance(value["group_key"], str) or not isinstance(value["unit"], str):
+        return False
+    if not isinstance(value["identities"], list) or not value["identities"]:
+        return False
+    if not all(_valid_identity_data(identity) for identity in value["identities"]):
+        return False
+    if not isinstance(value["original"], dict) or not isinstance(value["owned"], dict):
+        return False
+    if value["action"] == "pause":
+        return (
+            value["original"] == {"state": "running"}
+            and value["owned"] == {"state": "stopped"}
+        )
+    if set(value["original"]) != set(value["owned"]) or not value["owned"]:
+        return False
+    if value["unit"]:
+        return (
+            not value["unit"].startswith("-")
+            and "/" not in value["unit"]
+            and value["unit"].endswith((".scope", ".service"))
+            and set(value["owned"]) <= {"CPUWeight", "IOWeight", "MemoryLow"}
+            and all(isinstance(state, str) and state.isdecimal()
+                    for state in value["original"].values())
+            and all(isinstance(state, str) and state.isdecimal()
+                    for state in value["owned"].values())
+        )
+    if len(value["identities"]) != 1 or not set(value["owned"]) <= {"cpu", "io"}:
+        return False
+    for name, state in value["original"].items():
+        owned = value["owned"][name]
+        if name == "cpu":
+            if (not isinstance(state, int) or isinstance(state, bool) or not 0 <= state <= 19
+                    or not isinstance(owned, int) or isinstance(owned, bool) or not 0 <= owned <= 19):
+                return False
+        elif name == "io":
+            if not all(
+                isinstance(item, list) and len(item) == 2
+                and all(isinstance(part, int) and not isinstance(part, bool) for part in item)
+                and item[0] in (0, 2, 3) and 0 <= item[1] <= 7
+                for item in (state, owned)
+            ):
+                return False
+    return True
+
+
+def _valid_runtime_journal(value):
+    return (
+        isinstance(value, dict)
+        and set(value) == {"version", "entries"}
+        and isinstance(value["version"], int)
+        and not isinstance(value["version"], bool)
+        and value["version"] == RUNTIME_JOURNAL_VERSION
+        and isinstance(value["entries"], list)
+        and all(_valid_runtime_entry(entry) for entry in value["entries"])
+    )
+
+
+def load_runtime_journal(path=None):
+    """Load validated crash state; malformed state is never acted upon."""
+    path = path or runtime_journal_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            journal = json.load(fh)
+    except FileNotFoundError:
+        return _empty_runtime_journal(), Capability(
+            "journal", "full", "Runtime journal is empty")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return _empty_runtime_journal(), Capability(
+            "journal", "unavailable", "Runtime journal could not be read")
+    if not _valid_runtime_journal(journal):
+        return _empty_runtime_journal(), Capability(
+            "journal", "unavailable", "Runtime journal was corrupt and was ignored")
+    return journal, Capability("journal", "full", "Runtime journal loaded")
+
+
+def save_runtime_journal(path, journal):
+    """Atomically replace runtime state using an owner-only temporary file."""
+    if not _valid_runtime_journal(journal):
+        return False
+    temporary_path = path + ".tmp"
+    fd = None
+    try:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None
+            json.dump(journal, fh, separators=(",", ":"), sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary_path, path)
+        return True
+    except (OSError, TypeError, ValueError):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        return False
+
+
+class MemoryJournal:
+    """A small injectable journal for tests and display-only integrations."""
+
+    def __init__(self, journal=None):
+        self.journal = journal if _valid_runtime_journal(journal) else _empty_runtime_journal()
+
+    def load(self):
+        return json.loads(json.dumps(self.journal)), Capability(
+            "journal", "full", "Runtime journal loaded")
+
+    def replace_action(self, action, entries):
+        current, _capability = self.load()
+        current["entries"] = [
+            entry for entry in current["entries"] if entry["action"] != action
+        ] + list(entries)
+        if not _valid_runtime_journal(current):
+            return False
+        self.journal = current
+        return True
+
+
+class RuntimeJournal:
+    """Persistent journal adapter shared by action and resource controllers."""
+
+    def __init__(self, path=None):
+        self.path = path or runtime_journal_path()
+
+    def load(self):
+        return load_runtime_journal(self.path)
+
+    def replace_action(self, action, entries):
+        current, capability = self.load()
+        if capability.level == "unavailable":
+            current = _empty_runtime_journal()
+        current["entries"] = [
+            entry for entry in current["entries"] if entry["action"] != action
+        ] + list(entries)
+        return save_runtime_journal(self.path, current)
+
+
+def _identity_data(identity):
+    return {"pid": identity.pid, "start_time": identity.start_time}
+
+
+def _identity_from_data(value):
+    return ProcessIdentity(value["pid"], value["start_time"])
+
+
+def _current_user_identity(identity, source=None, uid=None):
+    """Check an exact live identity and, for procfs, its current-user ownership."""
+    if not same_process(identity, source=source):
+        return False
+    if source is not None:
+        # Test/injected sources provide no UID surface; production uses procfs below.
+        return True
+    try:
+        return os.stat(os.path.join("/proc", str(identity.pid))).st_uid == (
+            os.getuid() if uid is None else uid
+        )
+    except OSError:
+        return False
+
+
+def _default_runner(command):
+    try:
+        completed = subprocess.run(
+            tuple(command),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        )
+        return completed.returncode == 0, completed.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+def _process_restore_value(runner, identity, kind):
+    pid = str(identity.pid)
+    if kind == "cpu":
+        ok, output = _run_probe(runner, ("ps", "-o", "ni=", "-p", pid))
+        try:
+            value = int(output.strip())
+            return value if ok and 0 <= value <= 19 else None
+        except ValueError:
+            return None
+    ok, output = _run_probe(runner, ("ionice", "-p", pid))
+    if not ok:
+        return None
+    output = output.strip()
+    if output in ("none: prio 0", "none"):
+        return (0, 0)
+    if output in ("idle", "idle: prio 0"):
+        return (3, 0)
+    prefix = "best-effort: prio "
+    if output.startswith(prefix) and output[len(prefix):] in tuple(str(i) for i in range(8)):
+        return 2, int(output[len(prefix):])
+    return None
+
+
+def _process_restore_command(identity, kind, value):
+    if kind == "cpu":
+        return "renice", "-n", str(value), "-p", str(identity.pid)
+    io_class, priority = value
+    command = ("ionice", "-c", str(io_class))
+    if io_class == 2:
+        command += ("-n", str(priority))
+    return command + ("-p", str(identity.pid),)
+
+
+def _restore_resource_entry(entry, runner, source):
+    """Restore one validated entry, preserving only retryable unresolved values."""
+    identities = tuple(_identity_from_data(value) for value in entry["identities"])
+    if not all(_current_user_identity(identity, source=source) for identity in identities):
+        return None, True
+    original = dict(entry["original"])
+    owned = dict(entry["owned"])
+    changed = False
+    if entry["unit"]:
+        ok, output = _run_probe(runner, (
+            "systemctl", "--user", "show", entry["unit"],
+            "--property=CPUWeight,IOWeight,MemoryLow",
+        ))
+        current = {}
+        if ok:
+            for line in output.splitlines():
+                name, separator, value = line.partition("=")
+                if separator and name in ("CPUWeight", "IOWeight", "MemoryLow"):
+                    current[name] = value
+        for name, expected in tuple(owned.items()):
+            if name not in original:
+                owned.pop(name, None)
+                changed = True
+                continue
+            if name not in current:
+                continue
+            if current[name] != expected:
+                original.pop(name, None)
+                owned.pop(name, None)
+                changed = True
+                continue
+            if not all(_current_user_identity(identity, source=source) for identity in identities):
+                return None, True
+            value = "" if name != "MemoryLow" and original[name] == str(2**64 - 1) else original[name]
+            restored, _output = _run_probe(runner, (
+                "systemctl", "--user", "set-property", "--runtime", entry["unit"],
+                "%s=%s" % (name, value),
+            ))
+            if restored:
+                original.pop(name, None)
+                owned.pop(name, None)
+                changed = True
+    else:
+        if len(identities) != 1:
+            return None, True
+        identity = identities[0]
+        for kind, expected in tuple(owned.items()):
+            if kind not in original or kind not in ("cpu", "io"):
+                owned.pop(kind, None)
+                original.pop(kind, None)
+                changed = True
+                continue
+            expected_value = tuple(expected) if kind == "io" and isinstance(expected, list) else expected
+            original_value = tuple(original[kind]) if kind == "io" and isinstance(original[kind], list) else original[kind]
+            current = _process_restore_value(runner, identity, kind)
+            if current is None:
+                continue
+            if current != expected_value:
+                original.pop(kind, None)
+                owned.pop(kind, None)
+                changed = True
+                continue
+            if not _current_user_identity(identity, source=source):
+                return None, True
+            restored, _output = _run_probe(
+                runner, _process_restore_command(identity, kind, original_value))
+            if restored:
+                original.pop(kind, None)
+                owned.pop(kind, None)
+                changed = True
+    if not owned:
+        return None, True
+    restored = dict(entry)
+    restored["original"] = original
+    restored["owned"] = owned
+    return restored, changed
+
+
+def restore_from_journal(path=None, runner=None, source=None):
+    """Idempotently restore only values still owned by this optimizer instance."""
+    path = path or runtime_journal_path()
+    journal, capability = load_runtime_journal(path)
+    if capability.level == "unavailable":
+        return (capability,)
+    runner = runner or _default_runner
+    retained = []
+    changed = False
+    for entry in journal["entries"]:
+        if entry["action"] == "pause":
+            identity_results = []
+            for data in entry["identities"]:
+                identity = _identity_from_data(data)
+                if not _current_user_identity(identity, source=source):
+                    changed = True
+                    continue
+                try:
+                    os.kill(identity.pid, signal.SIGCONT)
+                    changed = True
+                except OSError:
+                    identity_results.append(data)
+            if identity_results:
+                retained.append(dict(entry, identities=identity_results))
+            continue
+        restored, entry_changed = _restore_resource_entry(entry, runner, source)
+        changed |= entry_changed
+        if restored is not None:
+            retained.append(restored)
+    if changed:
+        save_runtime_journal(path, {"version": RUNTIME_JOURNAL_VERSION, "entries": retained})
+    return (Capability(
+        "journal", "full" if not retained else "unavailable",
+        "Runtime journal restored" if not retained else "Runtime journal restore pending",
+    ),)
+
+
+def _action_allowed(group):
+    return group.managed and group.role not in (
+        Role.PRIMARY, Role.MEETING, Role.PROTECTED,
+    )
+
+
+@dataclass(frozen=True)
+class PausedGroup:
+    group_key: str
+    unit: str
+    identities: Tuple[ProcessIdentity, ...]
+    backend: str
+
+
+class AppController:
+    """Manual application controls with identity checks and a one-way force gate."""
+
+    def __init__(self, runner, uid=os.getuid(), source=None, send_signal=None,
+                 desktop_close=None, clock=None, sleeper=None, journal=None,
+                 journal_path=None, lease=None):
+        self.runner = runner
+        self.uid = uid
+        self.source = source
+        self.send_signal = send_signal or self._os_signal
+        self.desktop_close = desktop_close
+        self.clock = clock or time.monotonic
+        self.sleeper = sleeper or time.sleep
+        self.journal = journal or RuntimeJournal(journal_path)
+        self.lease = lease
+        self.paused = {}
+        self._deep_focus_keys = set()
+        self._deep_focus_active = False
+        self._end_tokens = {}
+
+    def _run(self, command):
+        return _run_probe(self.runner, tuple(command))
+
+    def _current(self, identity):
+        return _current_user_identity(identity, source=self.source, uid=self.uid)
+
+    def _os_signal(self, identity, signum):
+        os.kill(identity.pid, signum)
+        return True
+
+    def _group_identities(self, group):
+        return tuple(
+            process.identity for process in group.processes
+            if process.uid == self.uid and self._current(process.identity)
+        )
+
+    def _exact_unit(self, group, identities):
+        return (
+            bool(group.unit)
+            and not group.unit.startswith("-")
+            and "/" not in group.unit
+            and group.unit.endswith((".scope", ".service"))
+            and len(identities) == len(group.processes)
+        )
+
+    def _denied(self, action, group):
+        if _action_allowed(group):
+            return None
+        protected = group.role in (Role.PRIMARY, Role.MEETING, Role.PROTECTED)
+        detail = (
+            "Protected groups cannot be %sd" % action
+            if protected else "Only managed application groups can be %sd" % action
+        )
+        return ActionResult(action, group.key, 0, 0, protected, detail)
+
+    def _signal(self, identity, signum):
+        if not self._current(identity):
+            return False
+        try:
+            return self.send_signal(identity, signum) is not False
+        except OSError:
+            return False
+
+    def _sync_pause_journal(self):
+        entries = []
+        for paused in self.paused.values():
+            entries.append({
+                "action": "pause",
+                "group_key": paused.group_key,
+                "identities": [_identity_data(identity) for identity in paused.identities],
+                "unit": paused.unit,
+                "original": {"state": "running"},
+                "owned": {"state": "stopped"},
+            })
+        self.journal.replace_action("pause", entries)
+
+    def _track(self, identities):
+        if self.lease is None:
+            return
+        for identity in identities:
+            self.lease.track(identity)
+
+    def _untrack(self, identities):
+        if self.lease is None:
+            return
+        for identity in identities:
+            self.lease.untrack(identity)
+
+    def pause(self, group):
+        denied = self._denied("pause", group)
+        if denied is not None:
+            return denied
+        if group.key in self.paused:
+            return ActionResult("pause", group.key, 0, 0, detail="Group is already paused")
+        identities = self._group_identities(group)
+        if not identities:
+            return ActionResult("pause", group.key, 0, 0, detail="No current identities to pause")
+        backend = "process"
+        changed = ()
+        if self._exact_unit(group, identities):
+            frozen, _output = self._run(("systemctl", "--user", "freeze", group.unit))
+            if frozen:
+                backend = "systemd"
+                changed = identities
+        if not changed:
+            changed = tuple(
+                identity for identity in identities
+                if self._signal(identity, signal.SIGSTOP)
+            )
+        if changed:
+            self.paused[group.key] = PausedGroup(group.key, group.unit, changed, backend)
+            self._track(changed)
+            self._sync_pause_journal()
+        return ActionResult("pause", group.key, len(changed), 0,
+                            detail="Paused" if changed else "No current identities were paused")
+
+    def resume(self, group_key):
+        paused = self.paused.get(group_key)
+        if paused is None:
+            return ActionResult("resume", group_key, 0, 0, detail="Group is not paused by this controller")
+        current = tuple(identity for identity in paused.identities if self._current(identity))
+        changed = ()
+        if paused.backend == "systemd" and len(current) == len(paused.identities):
+            thawed, _output = self._run(("systemctl", "--user", "thaw", paused.unit))
+            if thawed:
+                changed = current
+        if not changed:
+            changed = tuple(
+                identity for identity in current if self._signal(identity, signal.SIGCONT)
+            )
+        remaining = tuple(identity for identity in paused.identities if identity not in changed)
+        if remaining:
+            self.paused[group_key] = PausedGroup(
+                paused.group_key, paused.unit, remaining, paused.backend)
+        else:
+            self.paused.pop(group_key, None)
+        self._untrack(changed)
+        self._sync_pause_journal()
+        return ActionResult("resume", group_key, len(changed), len(remaining),
+                            detail="Resumed" if changed else "No current identities were resumed")
+
+    def set_deep_focus(self, groups, enabled):
+        if enabled:
+            if not self._deep_focus_active:
+                self._deep_focus_keys = set()
+                self._deep_focus_active = True
+            results = []
+            for group in groups:
+                if group.role != Role.BACKGROUND:
+                    continue
+                already_paused = group.key in self.paused
+                result = self.pause(group)
+                results.append(result)
+                if not already_paused and group.key in self.paused:
+                    self._deep_focus_keys.add(group.key)
+            return tuple(results)
+        results = tuple(self.resume(key) for key in tuple(self._deep_focus_keys))
+        self._deep_focus_keys.clear()
+        self._deep_focus_active = False
+        return results
+
+    def _wait_for_survivors(self, identities):
+        deadline = self.clock() + 3.0
+        while True:
+            survivors = tuple(identity for identity in identities if self._current(identity))
+            if not survivors or self.clock() >= deadline:
+                return survivors
+            self.sleeper(min(0.05, max(0.0, deadline - self.clock())))
+
+    def end(self, group):
+        denied = self._denied("end", group)
+        if denied is not None:
+            return denied
+        identities = self._group_identities(group)
+        if not identities:
+            return ActionResult("end", group.key, 0, 0, detail="No current identities to end")
+        changed = ()
+        if group.desktop_id and self.desktop_close is not None:
+            try:
+                requested = self.desktop_close(group)
+                if requested is not False:
+                    changed = identities
+            except Exception:
+                pass
+        elif self._exact_unit(group, identities):
+            stopped, _output = self._run(("systemctl", "--user", "stop", group.unit))
+            if stopped:
+                changed = identities
+        if not changed:
+            changed = tuple(
+                identity for identity in identities if self._signal(identity, signal.SIGTERM)
+            )
+        survivors = self._wait_for_survivors(identities)
+        end_token = ""
+        if survivors:
+            for token, ticket in tuple(self._end_tokens.items()):
+                if ticket[0] == group.key:
+                    del self._end_tokens[token]
+            end_token = secrets.token_urlsafe(24)
+            self._end_tokens[end_token] = (group.key, survivors)
+        detail = (
+            "Graceful end requested; survivors require Force confirmation"
+            if survivors else "Graceful end completed"
+        )
+        return ActionResult("end", group.key, len(changed), len(survivors),
+                            detail=detail, end_token=end_token)
+
+    def force(self, group, end_token):
+        denied = self._denied("force", group)
+        if denied is not None:
+            return denied
+        ticket = self._end_tokens.get(end_token)
+        if ticket is None or ticket[0] != group.key:
+            return ActionResult(
+                "force", group.key, 0, 0,
+                detail="Use graceful End and its current confirmation token first",
+            )
+        del self._end_tokens[end_token]
+        group_identities = {
+            process.identity for process in group.processes if process.uid == self.uid
+        }
+        targets = tuple(
+            identity for identity in ticket[1]
+            if identity in group_identities and self._current(identity)
+        )
+        changed = tuple(
+            identity for identity in targets if self._signal(identity, signal.SIGKILL)
+        )
+        return ActionResult("force", group.key, len(changed), len(targets) - len(changed),
+                            detail="Force requested" if changed else "No matching identities remain")
+
+
+class GuardLease:
+    """Own the pause guard process used to undo pauses after a client crash."""
+
+    def __init__(self, script_path=None, popen_factory=None, environment=None):
+        self.script_path = script_path or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "optimizer_guard.py")
+        self.popen_factory = popen_factory or subprocess.Popen
+        self.environment = environment
+        self.process = None
+
+    def _start(self):
+        if self.process is not None and self.process.poll() is None:
+            return True
+        try:
+            self.process = self.popen_factory(
+                (sys.executable, self.script_path), stdin=subprocess.PIPE, text=True,
+                env=self.environment)
+            return self.process.stdin is not None
+        except OSError:
+            self.process = None
+            return False
+
+    def _write(self, message):
+        if not self._start():
+            return False
+        try:
+            self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            self.process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            return False
+
+    def track(self, identity):
+        return self._write(dict({"op": "track"}, **_identity_data(identity)))
+
+    def untrack(self, identity):
+        return self._write(dict({"op": "untrack"}, **_identity_data(identity)))
+
+    def close(self):
+        if self.process is None:
+            return
+        self._write({"op": "close"})
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            self.process.wait(timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            self.process = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
