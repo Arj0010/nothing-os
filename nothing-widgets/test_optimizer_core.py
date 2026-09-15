@@ -336,6 +336,84 @@ class ResourceControllerTest(unittest.TestCase):
         controller.restore()
         self.assertEqual(runner.commands[-1], ("powerprofilesctl", "set", "balanced"))
 
+    def test_unit_replacement_captures_its_own_baseline(self):
+        runner = resource_runner()
+        source = FakeProcessSource({10: 1000})
+        controller = self.controller(runner, source)
+        group = sample_groups()[0]
+        controller.apply(oc.Mode.FOCUS, (group,), True)
+        query = ("systemctl", "--user", "show", group.unit,
+                 "--property=CPUWeight,IOWeight,MemoryLow")
+        source.start_times[10] = 1001
+        replacement = replace(group, processes=(replace(
+            group.processes[0], identity=oc.ProcessIdentity(10, 1001)),))
+        runner.responses[query] = "CPUWeight=222\nIOWeight=333\nMemoryLow=444\n"
+        controller.apply(oc.Mode.FOCUS, (replacement,), True)
+        runner.responses[query] = "CPUWeight=1400\nIOWeight=1200\nMemoryLow=268435456\n"
+        before = len(runner.commands)
+        controller.restore()
+        restored = [c[-1] for c in runner.commands[before:]
+                    if c[:3] == ("systemctl", "--user", "set-property")]
+        self.assertCountEqual(restored, ["CPUWeight=222", "IOWeight=333", "MemoryLow=444"])
+
+    def test_failed_unit_readback_remains_pending_until_partial_write_is_restored(self):
+        runner = resource_runner(fail={"renice", "ionice"})
+        query = ("systemctl", "--user", "show", "app-agent.scope",
+                 "--property=CPUWeight,IOWeight,MemoryLow")
+        run = runner.run
+        def partial(command, input_text=""):
+            result = run(command, input_text)
+            if command[:3] == ("systemctl", "--user", "set-property") and len(command) == 8:
+                runner.responses[query] = (False, "temporarily unavailable")
+                return False, "partial write"
+            return result
+        runner.run = partial
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[:1], True)
+        for _ in range(2):
+            caps = {c.name: c.level for c in controller.restore()}
+            self.assertEqual(caps["cpu_io"], "unavailable")
+            self.assertEqual(caps["memory"], "unavailable")
+        runner.responses[query] = "CPUWeight=1400\nIOWeight=100\nMemoryLow=0\n"
+        before = len(runner.commands)
+        caps = {c.name: c.level for c in controller.restore()}
+        restored = [c[-1] for c in runner.commands[before:]
+                    if c[:3] == ("systemctl", "--user", "set-property")]
+        self.assertEqual(restored, ["CPUWeight=100"])
+        self.assertEqual(caps["cpu_io"], "full")
+        before = len(runner.commands)
+        controller.restore()
+        self.assertEqual(len(runner.commands), before)
+
+    def test_process_reapply_restores_external_nice_and_io_baselines(self):
+        runner = resource_runner(fail_prefixes={("systemctl", "--user", "set-property")})
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[1:], True)
+        runner.responses[("ps", "-o", "ni=", "-p", "20")] = "15"
+        runner.responses[("ionice", "-p", "20")] = "best-effort: prio 5"
+        controller.apply(oc.Mode.PERFORMANCE, sample_groups()[1:], True)
+        runner.responses[("ps", "-o", "ni=", "-p", "20")] = "8"
+        runner.responses[("ionice", "-p", "20")] = "best-effort: prio 7"
+        before = len(runner.commands)
+        controller.restore()
+        self.assertIn(("renice", "-n", "15", "-p", "20"), runner.commands[before:])
+        self.assertIn(("ionice", "-c", "2", "-n", "5", "-p", "20"), runner.commands[before:])
+
+    def test_unit_reapply_restores_external_property_baselines(self):
+        runner = resource_runner()
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[:1], True)
+        query = ("systemctl", "--user", "show", "app-agent.scope",
+                 "--property=CPUWeight,IOWeight,MemoryLow")
+        runner.responses[query] = "CPUWeight=222\nIOWeight=333\nMemoryLow=444\n"
+        controller.apply(oc.Mode.PERFORMANCE, sample_groups()[:1], True)
+        runner.responses[query] = "CPUWeight=2000\nIOWeight=1800\nMemoryLow=268435456\n"
+        before = len(runner.commands)
+        controller.restore()
+        restored = [c[-1] for c in runner.commands[before:]
+                    if c[:3] == ("systemctl", "--user", "set-property")]
+        self.assertCountEqual(restored, ["CPUWeight=222", "IOWeight=333", "MemoryLow=444"])
+
 
 class CaptureTest(unittest.TestCase):
     def test_attributed_brave_capture_promotes_brave(self):

@@ -790,6 +790,7 @@ class ResourceController:
         self._profile_original = None
         self._profile_owned = None
         self._units = {}
+        self._unit_pending = {}
         self._unit_identities = {}
         self._processes = {}
 
@@ -827,7 +828,12 @@ class ResourceController:
 
     def _unit_apply(self, group, policy):
         identities = tuple(p.identity for p in group.processes)
+        previous = self._unit_identities.get(group.unit, ())
+        if previous and (not set(previous).intersection(identities)
+                         or not all(self._current(i) for i in previous)):
+            self._forget_unit(group.unit)
         before = self._unit_values(group.unit)
+        self._reconcile_unit(group.unit, before)
         if len(before) != 3 or not all(self._current(i) for i in identities):
             return set()
         desired = {"CPUWeight": str(policy.cpu_weight), "IOWeight": str(policy.io_weight),
@@ -836,21 +842,52 @@ class ResourceController:
                    "CPUWeight=%d" % policy.cpu_weight, "IOWeight=%d" % policy.io_weight,
                    "MemoryLow=%s" % ("256M" if policy.memory_protection == "protected" else "0"))
         ok, _ = self._run(command)
+        journal = self._units.setdefault(group.unit, {})
+        pending = self._unit_pending.setdefault(group.unit, {})
+        for name, value in desired.items():
+            original = journal.get(name, (before[name], None))[0]
+            if ok and (before[name] != value or name in journal):
+                journal[name] = (original, value)
+            elif not ok and before[name] != value:
+                # This is an attempted write, not yet a confirmed owned change.
+                # Keep it separately until a later read establishes its outcome.
+                pending[name] = (original, value)
         # A multi-property call can fail after applying a subset. Read back that
         # subset so one unsupported property cannot lose successful mutations.
         after = desired if ok else self._unit_values(group.unit)
         succeeded = {name for name, value in desired.items()
                      if after.get(name) == value and (ok or before[name] != value)}
-        for name in succeeded:
-            journal = self._units.setdefault(group.unit, {})
-            original = journal.get(name, (before[name], None))[0]
-            if before[name] != desired[name] or name in journal:
-                journal[name] = (original, desired[name])
-        if self._units.get(group.unit):
+        self._reconcile_unit(group.unit, after)
+        if self._units.get(group.unit) or self._unit_pending.get(group.unit):
             self._unit_identities[group.unit] = identities
         else:
-            self._units.pop(group.unit, None)
+            self._forget_unit(group.unit)
         return succeeded
+
+    def _forget_unit(self, unit):
+        self._units.pop(unit, None)
+        self._unit_pending.pop(unit, None)
+        self._unit_identities.pop(unit, None)
+
+    def _reconcile_unit(self, unit, current):
+        """Resolve attempted writes and relinquish externally changed values."""
+        journal = self._units.get(unit, {})
+        pending = self._unit_pending.get(unit, {})
+        for name, (original, requested) in tuple(pending.items()):
+            if name not in current:
+                continue
+            if current[name] == requested:
+                journal[name] = (original, requested)
+            del pending[name]
+        for name, (_original, owned) in tuple(journal.items()):
+            if name in current and current[name] != owned:
+                del journal[name]
+        if journal:
+            self._units[unit] = journal
+        else:
+            self._units.pop(unit, None)
+        if not pending:
+            self._unit_pending.pop(unit, None)
 
     def _process_value(self, identity, kind):
         pid = str(identity.pid)
@@ -893,11 +930,14 @@ class ResourceController:
                 if not self._current(identity):
                     continue
                 before = self._process_value(identity, kind)
+                key = (identity, kind)
+                if (before is not None and key in self._processes
+                        and before != self._processes[key][1]):
+                    del self._processes[key]
                 if before is None or not self._current(identity):
                     continue
                 ok, _ = self._run(self._process_command(identity, kind, wanted))
                 if ok:
-                    key = (identity, kind)
                     original = self._processes.get(key, (before, None))[0]
                     if before != wanted or key in self._processes:
                         self._processes[key] = (original, wanted)
@@ -979,13 +1019,15 @@ class ResourceController:
                 del self._processes[key]
             else:
                 failures.add("cpu_io")
-        for unit, journal in tuple(self._units.items()):
-            identities = self._unit_identities[unit]
+        for unit, identities in tuple(self._unit_identities.items()):
             if not all(self._current(i) for i in identities):
-                del self._units[unit]
-                del self._unit_identities[unit]
+                self._forget_unit(unit)
                 continue
             current = self._unit_values(unit)
+            self._reconcile_unit(unit, current)
+            for name in self._unit_pending.get(unit, {}):
+                failures.add("memory" if name == "MemoryLow" else "cpu_io")
+            journal = self._units.get(unit, {})
             for name, (original, owned) in tuple(journal.items()):
                 capability = "memory" if name == "MemoryLow" else "cpu_io"
                 if name not in current:
@@ -1006,9 +1048,8 @@ class ResourceController:
                     del journal[name]
                 else:
                     failures.add(capability)
-            if not journal:
-                del self._units[unit]
-                del self._unit_identities[unit]
+            if not journal and not self._unit_pending.get(unit):
+                self._forget_unit(unit)
         try:
             network = self.network.restore()
         except Exception:
