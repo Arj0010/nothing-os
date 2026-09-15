@@ -6,7 +6,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional, Protocol, Tuple
 
 
 class Mode(str, Enum):
@@ -732,3 +732,302 @@ def detect_capabilities(runner) -> Tuple[Capability, ...]:
         Capability("power", "unavailable", "power-profiles service is unavailable")
     )
     return network, power
+
+
+POWER_PROFILE = {
+    Mode.AUTO: "balanced",
+    Mode.PERFORMANCE: "performance",
+    Mode.BATTERY: "power-saver",
+    Mode.FOCUS: "balanced",
+}
+
+
+@dataclass(frozen=True)
+class AppliedGroupState:
+    group_key: str
+    unit: str
+    identities: Tuple[ProcessIdentity, ...]
+    backend: str
+
+
+@dataclass(frozen=True)
+class AppliedState:
+    mode: Mode
+    groups: Tuple[AppliedGroupState, ...]
+    capabilities: Tuple[Capability, ...]
+
+
+class NetworkBackend(Protocol):
+    def apply(self, groups, policies) -> Capability: ...
+
+    def restore(self) -> Capability: ...
+
+
+class BasicNetworkBackend:
+    """A truthful placeholder until the separate network helper is installed."""
+
+    def apply(self, groups, policies) -> Capability:
+        return Capability("network", "fallback", "NETWORK · BASIC")
+
+    def restore(self) -> Capability:
+        return Capability("network", "fallback", "NETWORK · BASIC")
+
+
+class ResourceController:
+    """Apply best-effort policy and retain only successful, reversible writes.
+
+    ``runner`` is an argument-list command runner. ``source`` optionally supplies
+    start_time(pid), as in same_process; production defaults to fresh procfs reads.
+    Failed restores remain pending for retry. External changes relinquish ownership.
+    """
+
+    def __init__(self, runner, uid=os.getuid(), network=None, source=None):
+        self.runner = runner
+        self.uid = uid
+        self.network = network if network is not None else BasicNetworkBackend()
+        self.source = source
+        self._profile_read = False
+        self._profile_original = None
+        self._profile_owned = None
+        self._units = {}
+        self._unit_identities = {}
+        self._processes = {}
+
+    def _run(self, command):
+        return _run_probe(self.runner, tuple(command))
+
+    def _current(self, identity):
+        return same_process(identity, source=self.source)
+
+    def _power(self, mode):
+        if not self._profile_read:
+            self._profile_read = True
+            ok, value = self._run(("powerprofilesctl", "get"))
+            if ok and value.strip() in set(POWER_PROFILE.values()):
+                self._profile_original = value.strip()
+        wanted = POWER_PROFILE[mode]
+        if self._profile_original is not None:
+            ok, _ = self._run(("powerprofilesctl", "set", wanted))
+            if ok:
+                self._profile_owned = wanted
+                return Capability("power", "full", "Platform profile: " + wanted)
+        return Capability("power", "unavailable", "Platform profile change unavailable")
+
+    def _unit_values(self, unit):
+        ok, output = self._run(("systemctl", "--user", "show", unit,
+                                "--property=CPUWeight,IOWeight,MemoryLow"))
+        values = {}
+        if ok:
+            for line in output.splitlines():
+                name, sep, value = line.partition("=")
+                if sep and name in ("CPUWeight", "IOWeight", "MemoryLow"):
+                    if value.isascii() and value.isdecimal():
+                        values[name] = str(int(value))
+        return values
+
+    def _unit_apply(self, group, policy):
+        identities = tuple(p.identity for p in group.processes)
+        before = self._unit_values(group.unit)
+        if len(before) != 3 or not all(self._current(i) for i in identities):
+            return set()
+        desired = {"CPUWeight": str(policy.cpu_weight), "IOWeight": str(policy.io_weight),
+                   "MemoryLow": "268435456" if policy.memory_protection == "protected" else "0"}
+        command = ("systemctl", "--user", "set-property", "--runtime", group.unit,
+                   "CPUWeight=%d" % policy.cpu_weight, "IOWeight=%d" % policy.io_weight,
+                   "MemoryLow=%s" % ("256M" if policy.memory_protection == "protected" else "0"))
+        ok, _ = self._run(command)
+        # A multi-property call can fail after applying a subset. Read back that
+        # subset so one unsupported property cannot lose successful mutations.
+        after = desired if ok else self._unit_values(group.unit)
+        succeeded = {name for name, value in desired.items()
+                     if after.get(name) == value and (ok or before[name] != value)}
+        for name in succeeded:
+            journal = self._units.setdefault(group.unit, {})
+            original = journal.get(name, (before[name], None))[0]
+            if before[name] != desired[name] or name in journal:
+                journal[name] = (original, desired[name])
+        if self._units.get(group.unit):
+            self._unit_identities[group.unit] = identities
+        else:
+            self._units.pop(group.unit, None)
+        return succeeded
+
+    def _process_value(self, identity, kind):
+        pid = str(identity.pid)
+        if kind == "cpu":
+            ok, output = self._run(("ps", "-o", "ni=", "-p", pid))
+            try:
+                value = int(output.strip())
+                return value if ok and 0 <= value <= 19 else None
+            except ValueError:
+                return None
+        ok, output = self._run(("ionice", "-p", pid))
+        if not ok:
+            return None
+        output = output.strip()
+        if output in ("none: prio 0", "none"):
+            return (0, 0)
+        if output in ("idle", "idle: prio 0"):
+            return (3, 0)
+        prefix = "best-effort: prio "
+        if output.startswith(prefix) and output[len(prefix):] in tuple(str(i) for i in range(8)):
+            return (2, int(output[len(prefix):]))
+        return None
+
+    def _process_command(self, identity, kind, value):
+        if kind == "cpu":
+            return ("renice", "-n", str(value), "-p", str(identity.pid))
+        io_class, priority = value
+        command = ("ionice", "-c", str(io_class))
+        if io_class == 2:
+            command += ("-n", str(priority))
+        return command + ("-p", str(identity.pid))
+
+    def _process_apply(self, group, policy):
+        applied = []
+        for process in group.processes:
+            identity = process.identity
+            changed = False
+            for kind, wanted in (("cpu", max(0, min(19, policy.nice))),
+                                 ("io", (2, 7 if policy.nice >= 5 else 4))):
+                if not self._current(identity):
+                    continue
+                before = self._process_value(identity, kind)
+                if before is None or not self._current(identity):
+                    continue
+                ok, _ = self._run(self._process_command(identity, kind, wanted))
+                if ok:
+                    key = (identity, kind)
+                    original = self._processes.get(key, (before, None))[0]
+                    if before != wanted or key in self._processes:
+                        self._processes[key] = (original, wanted)
+                    changed = True
+            if changed:
+                applied.append(identity)
+        return tuple(applied)
+
+    def apply(self, mode, groups, active_primary=True) -> AppliedState:
+        mode = Mode(mode)
+        groups = tuple(groups)
+        power = self._power(mode)
+        applied = []
+        unit_count = {}
+        for group in groups:
+            unit_count[group.unit] = unit_count.get(group.unit, 0) + 1
+        policies = {}
+        eligible = []
+        full_cpu_io = full_memory = 0
+        any_cpu_io = False
+        for group in groups:
+            if (not group.managed or not group.processes
+                    or any(p.uid != self.uid or not self._current(p.identity)
+                           for p in group.processes)):
+                continue
+            eligible.append(group)
+            policy = policy_for(mode, group.role, active_primary)
+            policies[group.key] = policy
+            properties = set()
+            # Shared units cannot represent independently classified app groups.
+            if (group.unit and not group.unit.startswith("-") and "/" not in group.unit
+                    and group.unit.endswith((".scope", ".service")) and unit_count[group.unit] == 1):
+                properties = self._unit_apply(group, policy)
+            full_memory += "MemoryLow" in properties
+            if {"CPUWeight", "IOWeight"} <= properties:
+                full_cpu_io += 1
+                identities = tuple(p.identity for p in group.processes)
+                backend = "systemd"
+            else:
+                identities = self._process_apply(group, policy)
+                backend = "process"
+            any_cpu_io |= bool(identities or properties & {"CPUWeight", "IOWeight"})
+            if properties or identities:
+                if properties and not identities:
+                    identities = tuple(p.identity for p in group.processes)
+                    backend = "systemd"
+                applied.append(AppliedGroupState(group.key, group.unit, identities, backend))
+        cpu_level = "full" if eligible and full_cpu_io == len(eligible) else (
+            "fallback" if any_cpu_io else "unavailable")
+        memory_level = "full" if eligible and full_memory == len(eligible) else (
+            "fallback" if full_memory else "unavailable")
+        try:
+            network = self.network.apply(tuple(eligible), policies)
+        except Exception:
+            network = Capability("network", "unavailable", "Network backend failed")
+        return AppliedState(mode, tuple(applied), (
+            power, Capability("cpu_io", cpu_level, "User weights or safe process priorities"),
+            Capability("memory", memory_level, "Soft memory protection only"), network))
+
+    def restore(self) -> Tuple[Capability, ...]:
+        failures = set()
+        for (identity, kind), (original, owned) in tuple(self._processes.items()):
+            key = (identity, kind)
+            if not self._current(identity):
+                del self._processes[key]
+                continue
+            current = self._process_value(identity, kind)
+            if current is None:
+                failures.add("cpu_io")
+                continue
+            if current != owned:
+                del self._processes[key]
+                continue
+            if not self._current(identity):
+                del self._processes[key]
+                continue
+            ok, _ = self._run(self._process_command(identity, kind, original))
+            if ok:
+                del self._processes[key]
+            else:
+                failures.add("cpu_io")
+        for unit, journal in tuple(self._units.items()):
+            identities = self._unit_identities[unit]
+            if not all(self._current(i) for i in identities):
+                del self._units[unit]
+                del self._unit_identities[unit]
+                continue
+            current = self._unit_values(unit)
+            for name, (original, owned) in tuple(journal.items()):
+                capability = "memory" if name == "MemoryLow" else "cpu_io"
+                if name not in current:
+                    failures.add(capability)
+                    continue
+                if current[name] != owned:
+                    del journal[name]
+                    continue
+                if not all(self._current(i) for i in identities):
+                    del journal[name]
+                    continue
+                # systemd represents an unset weight as UINT64_MAX; reset it
+                # with the documented empty assignment, not an invalid weight.
+                value = "" if name != "MemoryLow" and original == str(2**64 - 1) else original
+                ok, _ = self._run(("systemctl", "--user", "set-property", "--runtime",
+                                   unit, "%s=%s" % (name, value)))
+                if ok:
+                    del journal[name]
+                else:
+                    failures.add(capability)
+            if not journal:
+                del self._units[unit]
+                del self._unit_identities[unit]
+        try:
+            network = self.network.restore()
+        except Exception:
+            network = Capability("network", "unavailable", "Network restore failed")
+        if self._profile_owned is not None:
+            ok, current = self._run(("powerprofilesctl", "get"))
+            if not ok or current.strip() not in set(POWER_PROFILE.values()):
+                failures.add("power")
+            elif current.strip() != self._profile_owned:
+                self._profile_owned = None
+            else:
+                ok, _ = self._run(("powerprofilesctl", "set", self._profile_original))
+                if ok:
+                    self._profile_owned = None
+                else:
+                    failures.add("power")
+        if self._profile_owned is None:
+            self._profile_read = False
+            self._profile_original = None
+        return tuple(Capability(name, "unavailable" if name in failures else "full",
+                                "Restore pending" if name in failures else "Restore complete")
+                     for name in ("cpu_io", "memory", "power")) + (network,)

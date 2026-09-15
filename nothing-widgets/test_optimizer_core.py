@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import optimizer_core as oc
@@ -48,16 +49,292 @@ def brave_groups():
 class FakeRunner:
     """Controlled command runner for metadata and capability probes."""
 
-    def __init__(self, responses=None, missing=(), fail=()):
-        self.responses = responses or {}
+    def __init__(self, responses=None, missing=(), fail=(), outputs=None, fail_prefixes=()):
+        self.responses = responses or outputs or {}
         self.missing = set(missing)
         self.fail = set(fail)
+        self.fail_prefixes = set(fail_prefixes)
+        self.commands = []
 
     def __call__(self, command):
+        return self.run(command)
+
+    def run(self, command, input_text=""):
+        command = tuple(command)
+        self.commands.append(command)
         executable = command[0]
-        if executable in self.missing or executable in self.fail:
+        if (executable in self.missing or executable in self.fail
+                or any(command[:len(prefix)] == prefix for prefix in self.fail_prefixes)):
             return False, ""
-        return True, self.responses.get(tuple(command), "")
+        value = self.responses.get(command, "")
+        return value if isinstance(value, tuple) else (True, value)
+
+
+def sample_groups():
+    return (
+        oc.AppGroup("agent", "Claude", oc.Role.PRIMARY,
+                    (proc(10, 1, "claude", "/usr/bin/claude", "/app-agent.scope"),),
+                    unit="app-agent.scope"),
+        oc.AppGroup("postman", "Postman", oc.Role.BACKGROUND,
+                    (proc(20, 1, "postman", "/usr/bin/postman", "/app-postman.scope"),),
+                    unit="app-postman.scope"),
+    )
+
+
+def resource_runner(**kwargs):
+    outputs = {("powerprofilesctl", "get"): "balanced"}
+    for group in sample_groups():
+        outputs[("systemctl", "--user", "show", group.unit,
+                 "--property=CPUWeight,IOWeight,MemoryLow")] = (
+            "CPUWeight=100\nIOWeight=100\nMemoryLow=0\n")
+        pid = str(group.processes[0].identity.pid)
+        outputs[("ps", "-o", "ni=", "-p", pid)] = "0"
+        outputs[("ionice", "-p", pid)] = "none: prio 0"
+    outputs.update(kwargs.pop("outputs", {}))
+    return FakeRunner(outputs=outputs, **kwargs)
+
+
+class ResourceControllerTest(unittest.TestCase):
+    def controller(self, runner, source=None):
+        return oc.ResourceController(runner, uid=1000,
+                                     source=source or FakeProcessSource({10: 1000, 20: 2000}))
+
+    def test_performance_requests_platform_performance_profile(self):
+        runner = resource_runner()
+        self.controller(runner).apply(oc.Mode.PERFORMANCE, sample_groups(), True)
+        self.assertIn(("powerprofilesctl", "set", "performance"), runner.commands)
+
+    def test_modes_restore_original_profile_and_capture_it_once(self):
+        runner = resource_runner()
+        controller = self.controller(runner)
+        for mode, wanted in ((oc.Mode.BATTERY, "power-saver"),
+                             (oc.Mode.FOCUS, "balanced"), (oc.Mode.AUTO, "balanced")):
+            controller.apply(mode, (), True)
+            self.assertIn(("powerprofilesctl", "set", wanted), runner.commands)
+        controller.restore()
+        self.assertEqual(runner.commands.count(("powerprofilesctl", "get")), 2)
+        self.assertEqual(runner.commands[-1], ("powerprofilesctl", "set", "balanced"))
+
+    def test_unit_policy_uses_weights_and_only_soft_memory_protection(self):
+        runner = resource_runner()
+        state = self.controller(runner).apply(oc.Mode.FOCUS, sample_groups(), True)
+        self.assertIn(("systemctl", "--user", "set-property", "--runtime", "app-agent.scope",
+                       "CPUWeight=1400", "IOWeight=1200", "MemoryLow=256M"), runner.commands)
+        self.assertIn(("systemctl", "--user", "set-property", "--runtime", "app-postman.scope",
+                       "CPUWeight=20", "IOWeight=20", "MemoryLow=0"), runner.commands)
+        self.assertEqual([g.backend for g in state.groups], ["systemd", "systemd"])
+        self.assertEqual({c.name: c.level for c in state.capabilities}["cpu_io"], "full")
+
+    def test_background_fallback_is_only_deprioritized(self):
+        runner = resource_runner(fail_prefixes={("systemctl", "--user", "set-property")})
+        state = self.controller(runner).apply(oc.Mode.FOCUS, sample_groups(), True)
+        self.assertIn(("renice", "-n", "12", "-p", "20"), runner.commands)
+        self.assertIn(("ionice", "-c", "2", "-n", "7", "-p", "20"), runner.commands)
+        self.assertEqual({c.name: c.level for c in state.capabilities}["cpu_io"], "fallback")
+        self.assertTrue(all("SIGTERM" not in c and "SIGKILL" not in c for c in runner.commands))
+
+    def test_partial_backend_failure_keeps_power_and_io_success(self):
+        runner = resource_runner(fail={"renice"}, fail_prefixes={("systemctl", "--user", "set-property")})
+        state = self.controller(runner).apply(oc.Mode.PERFORMANCE, sample_groups(), True)
+        levels = {c.name: c.level for c in state.capabilities}
+        self.assertEqual(levels["power"], "full")
+        self.assertEqual(levels["cpu_io"], "fallback")
+        self.assertEqual(levels["memory"], "unavailable")
+        self.assertTrue(any(g.backend == "process" for g in state.groups))
+
+    def test_pid_reuse_between_renice_and_ionice_skips_second_mutation(self):
+        source = FakeProcessSource({10: 1000, 20: 2000})
+        runner = resource_runner(fail_prefixes={("systemctl", "--user", "set-property")})
+        original_run = runner.run
+        def run(command, input_text=""):
+            result = original_run(command, input_text)
+            if command[:2] == ("renice", "-n"):
+                source.start_times[int(command[-1])] += 1
+            return result
+        runner.run = run
+        self.controller(runner, source).apply(oc.Mode.FOCUS, sample_groups(), True)
+        self.assertFalse(any(c[:2] == ("ionice", "-c") for c in runner.commands))
+
+    def test_stale_foreign_and_unmanaged_targets_are_skipped(self):
+        groups = sample_groups()
+        variants = (
+            replace(groups[0], managed=False),
+            replace(groups[0], processes=(replace(groups[0].processes[0], uid=2000),)),
+            groups[1],
+        )
+        runner = resource_runner()
+        state = self.controller(runner, FakeProcessSource({20: 2001})).apply(
+            oc.Mode.FOCUS, variants, True)
+        self.assertFalse(state.groups)
+        self.assertFalse(any(c[0] in ("renice", "ionice", "systemctl") for c in runner.commands))
+
+    def test_unreadable_original_values_are_not_mutated(self):
+        runner = FakeRunner()
+        state = self.controller(runner).apply(oc.Mode.FOCUS, sample_groups(), True)
+        self.assertFalse(state.groups)
+        self.assertFalse(any(c[:2] in (("renice", "-n"), ("ionice", "-c"),
+                                      ("powerprofilesctl", "set")) for c in runner.commands))
+
+    def test_restore_only_successes_and_retry_failed_restore(self):
+        runner = resource_runner(fail={"renice"}, fail_prefixes={("systemctl", "--user", "set-property")})
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[1:], True)
+        runner.responses[("ionice", "-p", "20")] = "best-effort: prio 7"
+        runner.fail.add("ionice")
+        controller.restore()
+        runner.fail.clear()
+        controller.restore()
+        self.assertIn(("ionice", "-c", "0", "-p", "20"), runner.commands)
+        self.assertFalse(any(c[:2] == ("renice", "-n") and c[2] == "0" for c in runner.commands))
+        count = len(runner.commands)
+        controller.restore()
+        self.assertEqual(len(runner.commands), count)
+
+    def test_restore_does_not_overwrite_external_priority_change(self):
+        runner = resource_runner(fail_prefixes={("systemctl", "--user", "set-property")})
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[1:], True)
+        runner.responses[("ps", "-o", "ni=", "-p", "20")] = "15"
+        runner.responses[("ionice", "-p", "20")] = "idle"
+        before = len(runner.commands)
+        controller.restore()
+        self.assertFalse(any(c[:2] in (("renice", "-n"), ("ionice", "-c"))
+                             for c in runner.commands[before:]))
+
+    def test_basic_network_is_nonmutating_and_injectable(self):
+        backend = oc.BasicNetworkBackend()
+        expected = oc.Capability("network", "fallback", "NETWORK · BASIC")
+        self.assertEqual(backend.apply(sample_groups(), {}), expected)
+        self.assertEqual(backend.restore(), expected)
+        runner = resource_runner()
+        state = oc.ResourceController(runner, uid=1000, network=backend).apply(oc.Mode.AUTO, (), True)
+        self.assertIn(expected, state.capabilities)
+
+    def test_restore_rechecks_pid_identity(self):
+        source = FakeProcessSource({20: 2000})
+        runner = resource_runner(fail_prefixes={("systemctl", "--user", "set-property")})
+        controller = self.controller(runner, source)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[1:], True)
+        source.start_times[20] = 2001
+        before = len(runner.commands)
+        controller.restore()
+        self.assertFalse(any(c[0] in ("renice", "ionice", "ps") for c in runner.commands[before:]))
+
+    def test_memory_success_does_not_claim_cpu_io_success(self):
+        runner = resource_runner(fail={"renice", "ionice"})
+        run = runner.run
+        def partial(command, input_text=""):
+            result = run(command, input_text)
+            if command[:3] == ("systemctl", "--user", "set-property"):
+                runner.responses[("systemctl", "--user", "show", "app-agent.scope",
+                                  "--property=CPUWeight,IOWeight,MemoryLow")] = (
+                    "CPUWeight=100\nIOWeight=100\nMemoryLow=268435456\n")
+                return False, "CPU and I/O weights unavailable"
+            return result
+        runner.run = partial
+        state = self.controller(runner).apply(oc.Mode.FOCUS, sample_groups()[:1], True)
+        levels = {c.name: c.level for c in state.capabilities}
+        self.assertEqual(levels["memory"], "full")
+        self.assertEqual(levels["cpu_io"], "unavailable")
+
+    def test_partial_unit_write_restores_only_changed_properties(self):
+        runner = resource_runner(fail={"renice", "ionice"})
+        run = runner.run
+        def partial(command, input_text=""):
+            result = run(command, input_text)
+            if command[:3] == ("systemctl", "--user", "set-property") and len(command) == 8:
+                runner.responses[("systemctl", "--user", "show", "app-agent.scope",
+                                  "--property=CPUWeight,IOWeight,MemoryLow")] = (
+                    "CPUWeight=1400\nIOWeight=100\nMemoryLow=268435456\n")
+                return False, "I/O weight unavailable"
+            return result
+        runner.run = partial
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[:1], True)
+        before = len(runner.commands)
+        controller.restore()
+        restored = [c[-1] for c in runner.commands[before:]
+                    if c[:3] == ("systemctl", "--user", "set-property")]
+        self.assertCountEqual(restored, ["CPUWeight=100", "MemoryLow=0"])
+        before = len(runner.commands)
+        controller.restore()
+        self.assertEqual(len(runner.commands), before)
+
+    def test_unit_restore_keeps_activation_original_across_mode_changes(self):
+        runner = resource_runner()
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.FOCUS, sample_groups()[:1], True)
+        query = ("systemctl", "--user", "show", "app-agent.scope",
+                 "--property=CPUWeight,IOWeight,MemoryLow")
+        runner.responses[query] = "CPUWeight=1400\nIOWeight=1200\nMemoryLow=268435456\n"
+        controller.apply(oc.Mode.PERFORMANCE, sample_groups()[:1], True)
+        runner.responses[query] = "CPUWeight=2000\nIOWeight=1800\nMemoryLow=268435456\n"
+        runner.responses[("powerprofilesctl", "get")] = "performance"
+        before = len(runner.commands)
+        controller.restore()
+        restored = [c[-1] for c in runner.commands[before:]
+                    if c[:3] == ("systemctl", "--user", "set-property")]
+        self.assertCountEqual(restored, ["CPUWeight=100", "IOWeight=100", "MemoryLow=0"])
+        self.assertEqual(runner.commands[-1], ("powerprofilesctl", "set", "balanced"))
+
+    def test_failed_power_apply_is_not_restored_but_units_still_apply(self):
+        runner = resource_runner(fail_prefixes={("powerprofilesctl", "set")})
+        controller = self.controller(runner)
+        state = controller.apply(oc.Mode.BATTERY, sample_groups(), True)
+        self.assertEqual({c.name: c.level for c in state.capabilities}["power"], "unavailable")
+        self.assertEqual(len(state.groups), 2)
+        before = len(runner.commands)
+        controller.restore()
+        self.assertFalse(any(c[0] == "powerprofilesctl" for c in runner.commands[before:]))
+
+    def test_shared_unit_uses_independent_process_fallback(self):
+        groups = sample_groups()
+        runner = resource_runner()
+        state = self.controller(runner).apply(oc.Mode.FOCUS, (
+            groups[0], replace(groups[1], unit=groups[0].unit)), True)
+        self.assertFalse(any(c[0] == "systemctl" for c in runner.commands))
+        self.assertEqual([g.backend for g in state.groups], ["process", "process"])
+
+    def test_systemd_pid_reuse_during_original_probe_prevents_write(self):
+        source = FakeProcessSource({10: 1000})
+        runner = resource_runner()
+        run = runner.run
+        def reuse(command, input_text=""):
+            result = run(command, input_text)
+            if command[:3] == ("systemctl", "--user", "show"):
+                source.start_times[10] = 1001
+            return result
+        runner.run = reuse
+        self.controller(runner, source).apply(oc.Mode.FOCUS, sample_groups()[:1], True)
+        self.assertFalse(any(c[:3] == ("systemctl", "--user", "set-property")
+                             or c[:2] in (("renice", "-n"), ("ionice", "-c")) for c in runner.commands))
+
+    def test_malformed_power_restore_probe_keeps_restore_pending(self):
+        runner = resource_runner()
+        controller = self.controller(runner)
+        controller.apply(oc.Mode.BATTERY, (), True)
+        runner.responses[("powerprofilesctl", "get")] = ""
+        caps = {c.name: c.level for c in controller.restore()}
+        self.assertEqual(caps["power"], "unavailable")
+        runner.responses[("powerprofilesctl", "get")] = "power-saver"
+        controller.restore()
+        self.assertEqual(runner.commands[-1], ("powerprofilesctl", "set", "balanced"))
+
+    def test_network_exceptions_do_not_interrupt_power_or_restore(self):
+        class FailedNetwork:
+            def apply(self, groups, policies):
+                raise OSError("helper unavailable")
+            def restore(self):
+                raise OSError("helper unavailable")
+        runner = resource_runner()
+        controller = oc.ResourceController(runner, uid=1000, network=FailedNetwork())
+        state = controller.apply(oc.Mode.BATTERY, (), True)
+        levels = {c.name: c.level for c in state.capabilities}
+        self.assertEqual(levels["power"], "full")
+        self.assertEqual(levels["network"], "unavailable")
+        runner.responses[("powerprofilesctl", "get")] = "power-saver"
+        controller.restore()
+        self.assertEqual(runner.commands[-1], ("powerprofilesctl", "set", "balanced"))
 
 
 class CaptureTest(unittest.TestCase):
