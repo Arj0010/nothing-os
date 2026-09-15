@@ -41,8 +41,15 @@ class FakeProcessSource:
 class CurrentFakeProcessSource(FakeProcessSource):
     """A controlled source whose generated test identities are current by default."""
 
+    def __init__(self, start_times, states=None):
+        super().__init__(start_times)
+        self.states = states or {}
+
     def start_time(self, pid):
         return self.start_times.get(pid, pid * 100)
+
+    def state(self, pid):
+        return self.states.get(pid, "R")
 
 
 class FakeClock:
@@ -54,6 +61,41 @@ class FakeClock:
 
     def sleep(self, delay):
         self.value += delay
+
+
+class FakeLease:
+    """A fully in-memory guard protocol with controllable registration failure."""
+
+    def __init__(self, fail_track=False, fail_untrack=False):
+        self.fail_track = fail_track
+        self.fail_untrack = fail_untrack
+        self.tracked = []
+        self.untracked = []
+
+    def track(self, identity, backend="process", unit=""):
+        if self.fail_track:
+            return False
+        self.tracked.append((identity, backend, unit))
+        return True
+
+    def untrack(self, identity):
+        self.untracked.append(identity)
+        return not self.fail_untrack
+
+
+class FailingJournal:
+    def load(self):
+        return oc._empty_runtime_journal(), oc.Capability("journal", "full", "test")
+
+    def replace_action(self, action, entries):
+        del action, entries
+        return False
+
+
+class FailingReplaceJournal(oc.MemoryJournal):
+    def replace_entries(self, entries):
+        del entries
+        return False
 
 
 def brave_groups():
@@ -90,7 +132,12 @@ class FakeRunner:
         if (executable in self.missing or executable in self.fail
                 or any(command[:len(prefix)] == prefix for prefix in self.fail_prefixes)):
             return False, ""
-        value = self.responses.get(command, "")
+        value = self.responses.get(command)
+        if value is None and command[:3] == ("systemctl", "--user", "show") \
+                and command[-1:] == ("--property=FreezerState",):
+            value = "FreezerState=running"
+        if value is None:
+            value = ""
         return value if isinstance(value, tuple) else (True, value)
 
 
@@ -121,7 +168,8 @@ def resource_runner(**kwargs):
 class ResourceControllerTest(unittest.TestCase):
     def controller(self, runner, source=None):
         return oc.ResourceController(runner, uid=1000,
-                                     source=source or FakeProcessSource({10: 1000, 20: 2000}))
+                                     source=source or FakeProcessSource({10: 1000, 20: 2000}),
+                                     journal=oc.MemoryJournal())
 
     def test_performance_requests_platform_performance_profile(self):
         runner = resource_runner()
@@ -231,7 +279,9 @@ class ResourceControllerTest(unittest.TestCase):
         self.assertEqual(backend.apply(sample_groups(), {}), expected)
         self.assertEqual(backend.restore(), expected)
         runner = resource_runner()
-        state = oc.ResourceController(runner, uid=1000, network=backend).apply(oc.Mode.AUTO, (), True)
+        state = oc.ResourceController(
+            runner, uid=1000, network=backend, journal=oc.MemoryJournal()).apply(
+                oc.Mode.AUTO, (), True)
         self.assertIn(expected, state.capabilities)
 
     def test_restore_rechecks_pid_identity(self):
@@ -351,7 +401,8 @@ class ResourceControllerTest(unittest.TestCase):
             def restore(self):
                 raise OSError("helper unavailable")
         runner = resource_runner()
-        controller = oc.ResourceController(runner, uid=1000, network=FailedNetwork())
+        controller = oc.ResourceController(
+            runner, uid=1000, network=FailedNetwork(), journal=oc.MemoryJournal())
         state = controller.apply(oc.Mode.BATTERY, (), True)
         levels = {c.name: c.level for c in state.capabilities}
         self.assertEqual(levels["power"], "full")
@@ -933,20 +984,37 @@ def group_with_role(role, unit=None):
     )
 
 
-def controller_with_fakes(runner=None):
+def controller_with_fakes(runner=None, source=None, journal=None, lease=None,
+                          groups_provider=None):
     """Build an app controller that can target only generated fake identities."""
     signals = []
     clock = FakeClock()
+    source = source or CurrentFakeProcessSource({})
+
+    def send_signal(identity, signum):
+        signals.append((identity, signum))
+        if hasattr(source, "states"):
+            if signum == signal.SIGSTOP:
+                source.states[identity.pid] = "T"
+            elif signum == signal.SIGCONT:
+                source.states[identity.pid] = "R"
+        return True
+
+    kwargs = {}
+    if groups_provider is not None:
+        kwargs["groups_provider"] = groups_provider
     controller = oc.AppController(
         runner=runner or FakeRunner(
             fail_prefixes={("systemctl", "--user", "freeze")},
         ),
         uid=1000,
-        source=CurrentFakeProcessSource({}),
-        journal=oc.MemoryJournal(),
-        send_signal=lambda identity, signum: signals.append((identity, signum)) or True,
+        source=source,
+        journal=journal or oc.MemoryJournal(),
+        lease=lease or FakeLease(),
+        send_signal=send_signal,
         clock=clock,
         sleeper=clock.sleep,
+        **kwargs
     )
     controller.signal_records = signals
     return controller
@@ -986,12 +1054,133 @@ class AppControllerTest(unittest.TestCase):
         )
 
     def test_pause_and_resume_prefer_the_exact_managed_user_unit(self):
-        controller = controller_with_fakes(runner=FakeRunner())
         group = group_with_role(oc.Role.INTERACTIVE)
+        freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
+        controller = controller_with_fakes(
+            runner=FakeRunner({freezer: "FreezerState=running"}),
+            groups_provider=lambda: (group,),
+        )
         self.assertEqual(controller.pause(group).changed, 1)
         self.assertIn(("systemctl", "--user", "freeze", group.unit), controller.runner.commands)
         self.assertEqual(controller.resume(group.key).changed, 1)
         self.assertIn(("systemctl", "--user", "thaw", group.unit), controller.runner.commands)
+        self.assertEqual(controller.signal_records, [])
+
+    def test_deep_focus_never_freezes_a_primary_sibling_in_a_shared_unit(self):
+        unit = "app-shared.scope"
+        background = replace(group_with_role(oc.Role.BACKGROUND), unit=unit)
+        primary = replace(group_with_role(oc.Role.PRIMARY), unit=unit)
+        controller = controller_with_fakes(
+            runner=FakeRunner({
+                ("systemctl", "--user", "show", unit, "--property=FreezerState"):
+                    "FreezerState=running",
+            }),
+            groups_provider=lambda: (background, primary),
+        )
+        controller.set_deep_focus((background, primary), True)
+        self.assertNotIn(("systemctl", "--user", "freeze", unit), controller.runner.commands)
+        self.assertIn((background.processes[0].identity, signal.SIGSTOP), controller.signal_records)
+        self.assertNotIn((primary.processes[0].identity, signal.SIGSTOP), controller.signal_records)
+
+    def test_stale_known_groups_cannot_authorize_a_shared_unit_freeze(self):
+        unit = "app-stale-shared.scope"
+        background = replace(group_with_role(oc.Role.BACKGROUND), unit=unit)
+        primary = replace(group_with_role(oc.Role.PRIMARY), unit=unit)
+        runner = FakeRunner({
+            ("systemctl", "--user", "show", unit, "--property=FreezerState"):
+                "FreezerState=running",
+        })
+        controller = controller_with_fakes(
+            runner=runner,
+            groups_provider=lambda: (background, primary),
+        )
+        self.assertEqual(controller.pause(background, known_groups=(background,)).changed, 1)
+        self.assertNotIn(("systemctl", "--user", "freeze", unit), runner.commands)
+        self.assertIn((background.processes[0].identity, signal.SIGSTOP), controller.signal_records)
+
+    def test_end_never_invokes_systemctl_stop(self):
+        group = group_with_role(oc.Role.BACKGROUND)
+        controller = controller_with_fakes(runner=FakeRunner())
+        self.assertEqual(controller.end(group).changed, 1)
+        self.assertFalse(any(command[:3] == ("systemctl", "--user", "stop")
+                             for command in controller.runner.commands))
+        self.assertIn((group.processes[0].identity, signal.SIGTERM), controller.signal_records)
+
+    def test_failed_unit_thaw_keeps_controller_owned_pause_pending(self):
+        group = group_with_role(oc.Role.BACKGROUND)
+        freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
+        runner = FakeRunner(
+            {freezer: "FreezerState=running"},
+            fail_prefixes={("systemctl", "--user", "thaw")},
+        )
+        controller = controller_with_fakes(
+            runner=runner,
+            groups_provider=lambda: (group,),
+        )
+        self.assertEqual(controller.pause(group).changed, 1)
+        self.assertEqual(controller.resume(group.key).changed, 0)
+        self.assertIn(group.key, controller.paused)
+        self.assertNotIn((group.processes[0].identity, signal.SIGCONT), controller.signal_records)
+        entries, _capability = controller.journal.load()
+        self.assertEqual(entries["entries"][0]["backend"], "systemd")
+
+    def test_unit_thaw_requires_fresh_exclusive_managed_ownership(self):
+        unit = "app-exclusive.scope"
+        group = replace(group_with_role(oc.Role.BACKGROUND), unit=unit)
+        sibling = replace(group_with_role(oc.Role.PRIMARY), unit=unit)
+        groups = [group]
+        runner = FakeRunner({
+            ("systemctl", "--user", "show", unit, "--property=FreezerState"):
+                "FreezerState=running",
+        })
+        controller = controller_with_fakes(runner=runner, groups_provider=lambda: tuple(groups))
+        self.assertEqual(controller.pause(group).changed, 1)
+        groups.append(sibling)
+        self.assertEqual(controller.resume(group.key).changed, 0)
+        self.assertIn(group.key, controller.paused)
+        self.assertNotIn(("systemctl", "--user", "thaw", unit), runner.commands)
+
+    def test_pause_never_claims_an_already_frozen_unit(self):
+        group = group_with_role(oc.Role.BACKGROUND)
+        freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
+        controller = controller_with_fakes(
+            runner=FakeRunner({freezer: "FreezerState=frozen"}),
+            groups_provider=lambda: (group,),
+        )
+        self.assertEqual(controller.pause(group).changed, 0)
+        self.assertNotIn(group.key, controller.paused)
+        self.assertEqual(controller.signal_records, [])
+
+    def test_pause_fails_closed_when_a_unit_freezer_state_is_unreadable(self):
+        group = group_with_role(oc.Role.BACKGROUND)
+        freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
+        controller = controller_with_fakes(
+            runner=FakeRunner(fail_prefixes={freezer}),
+            groups_provider=lambda: (group,),
+        )
+        self.assertEqual(controller.pause(group).changed, 0)
+        self.assertNotIn(group.key, controller.paused)
+        self.assertEqual(controller.signal_records, [])
+
+    def test_pause_does_not_mutate_when_guard_or_journal_registration_fails(self):
+        group = group_with_role(oc.Role.BACKGROUND, unit="")
+        for lease, journal in ((FakeLease(fail_track=True), oc.MemoryJournal()),
+                               (FakeLease(), FailingJournal())):
+            with self.subTest(lease=lease.fail_track):
+                controller = controller_with_fakes(lease=lease, journal=journal)
+                self.assertEqual(controller.pause(group).changed, 0)
+                self.assertEqual(controller.signal_records, [])
+                self.assertNotIn(group.key, controller.paused)
+
+    def test_pause_never_claims_an_already_stopped_process(self):
+        group = group_with_role(oc.Role.BACKGROUND, unit="")
+        source = CurrentFakeProcessSource(
+            {group.processes[0].identity.pid: group.processes[0].identity.start_time},
+            {group.processes[0].identity.pid: "T"},
+        )
+        controller = controller_with_fakes(source=source)
+        self.assertEqual(controller.pause(group).changed, 0)
+        self.assertNotIn(group.key, controller.paused)
         self.assertEqual(controller.signal_records, [])
 
     def test_actions_skip_a_reused_process_identity_before_any_signal(self):
@@ -1044,6 +1233,60 @@ class AppControllerTest(unittest.TestCase):
         self.assertEqual(set(controller.paused), {manual.key})
         self.assertIn((focus.processes[0].identity, signal.SIGCONT), controller.signal_records)
 
+    def test_deep_focus_does_not_resume_a_later_manual_pause_instance(self):
+        controller = controller_with_fakes()
+        group = group_with_role(oc.Role.BACKGROUND, unit="")
+        controller.set_deep_focus((group,), True)
+        self.assertEqual(controller.resume(group.key).changed, 1)
+        self.assertEqual(controller.pause(group).changed, 1)
+        before = list(controller.signal_records)
+        controller.set_deep_focus((group,), False)
+        self.assertEqual(set(controller.paused), {group.key})
+        self.assertEqual(controller.signal_records, before)
+
+    def test_resume_discards_stale_identity_and_allows_a_fresh_pause(self):
+        group = group_with_role(oc.Role.BACKGROUND, unit="")
+        source = CurrentFakeProcessSource({})
+        lease = FakeLease()
+        controller = controller_with_fakes(source=source, lease=lease)
+        self.assertEqual(controller.pause(group).changed, 1)
+        identity = group.processes[0].identity
+        source.start_times[identity.pid] = identity.start_time + 1
+        self.assertEqual(controller.resume(group.key).changed, 0)
+        self.assertNotIn(group.key, controller.paused)
+        self.assertIn(identity, lease.untracked)
+        replacement_identity = oc.ProcessIdentity(identity.pid, identity.start_time + 1)
+        source.states[identity.pid] = "R"
+        replacement = replace(group, processes=(replace(
+            group.processes[0], identity=replacement_identity),))
+        self.assertEqual(controller.pause(replacement).changed, 1)
+
+    def test_restore_interrupted_uses_injected_journal_runner_and_signal(self):
+        group = group_with_role(oc.Role.BACKGROUND, unit="")
+        identity = group.processes[0].identity
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause",
+                "group_key": group.key,
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "",
+                "backend": "process",
+                "original": {"state": "running"},
+                "owned": {"state": "stopped"},
+            }],
+        })
+        controller = controller_with_fakes(
+            journal=journal,
+            source=CurrentFakeProcessSource({identity.pid: identity.start_time},
+                                            {identity.pid: "T"}),
+        )
+        result = controller.restore_interrupted()
+        self.assertEqual(result[0].level, "full")
+        self.assertIn((identity, signal.SIGCONT), controller.signal_records)
+        entries, _capability = journal.load()
+        self.assertEqual(entries["entries"], [])
+
     def test_force_accepts_only_the_live_token_from_the_same_graceful_end(self):
         controller = controller_with_fakes()
         group = group_with_role(oc.Role.BACKGROUND, unit="")
@@ -1067,6 +1310,7 @@ class RuntimeJournalTest(unittest.TestCase):
                     "group_key": "test",
                     "identities": [{"pid": 301, "start_time": 30100}],
                     "unit": "",
+                    "backend": "process",
                     "original": {"state": "running"},
                     "owned": {"state": "stopped"},
                 }],
@@ -1154,6 +1398,66 @@ class RuntimeJournalTest(unittest.TestCase):
             restored, _capability = oc.load_runtime_journal(path)
             self.assertEqual(restored["entries"], [])
 
+    def test_restore_from_journal_thaws_owned_cgroup_pause_without_sigcont(self):
+        identity = oc.ProcessIdentity(323, 32300)
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause",
+                "group_key": "test",
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "app-test.scope",
+                "backend": "systemd",
+                "original": {"state": "running"},
+                "owned": {"state": "frozen"},
+            }],
+        })
+        runner = FakeRunner(fail_prefixes={("systemctl", "--user", "thaw")})
+        signals = []
+        result = oc.restore_from_journal(
+            runner=runner,
+            source=CurrentFakeProcessSource({323: 32300}),
+            journal=journal,
+            send_signal=lambda process, signum: signals.append((process, signum)) or True,
+        )
+        self.assertEqual(result[0].level, "unavailable")
+        self.assertIn(("systemctl", "--user", "thaw", "app-test.scope"), runner.commands)
+        self.assertEqual(signals, [])
+        entries, _capability = journal.load()
+        self.assertEqual(len(entries["entries"]), 1)
+        runner.fail_prefixes.clear()
+        self.assertEqual(oc.restore_from_journal(
+            runner=runner,
+            source=CurrentFakeProcessSource({323: 32300}),
+            journal=journal,
+            send_signal=lambda process, signum: signals.append((process, signum)) or True,
+        )[0].level, "full")
+        entries, _capability = journal.load()
+        self.assertEqual(entries["entries"], [])
+
+    def test_thaw_reports_degradation_when_the_journal_cannot_clear(self):
+        identity = oc.ProcessIdentity(324, 32400)
+        journal = FailingReplaceJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause",
+                "group_key": "test",
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "app-test.scope",
+                "backend": "systemd",
+                "original": {"state": "running"},
+                "owned": {"state": "frozen"},
+            }],
+        })
+        result = oc.restore_from_journal(
+            runner=FakeRunner(),
+            source=CurrentFakeProcessSource({324: 32400}),
+            journal=journal,
+        )
+        self.assertEqual(result[0].level, "unavailable")
+        entries, _capability = journal.load()
+        self.assertEqual(len(entries["entries"]), 1)
+
 
 class GuardIntegrationTest(unittest.TestCase):
     def _state(self, pid):
@@ -1239,7 +1543,10 @@ class GuardIntegrationTest(unittest.TestCase):
             environment["XDG_CONFIG_HOME"] = config_home
             lease = oc.GuardLease(environment=environment)
             self.addCleanup(lease.close)
-            self.assertTrue(lease.track(oc.ProcessIdentity(child.pid, start_time)))
+            self.assertTrue(lease.track(
+                oc.ProcessIdentity(child.pid, start_time),
+                backend="process", unit="app-test.scope",
+            ))
             os.kill(child.pid, signal.SIGSTOP)
             stopped_deadline = time.monotonic() + 2
             while self._state(child.pid) != "T" and time.monotonic() < stopped_deadline:

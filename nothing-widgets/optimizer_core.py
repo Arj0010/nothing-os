@@ -1155,8 +1155,13 @@ def _valid_identity_data(value):
 
 
 def _valid_runtime_entry(value):
-    if not isinstance(value, dict) or set(value) != {
-            "action", "group_key", "identities", "unit", "original", "owned"}:
+    if not isinstance(value, dict):
+        return False
+    common = {"action", "group_key", "identities", "unit", "original", "owned"}
+    if value.get("action") == "pause":
+        if set(value) != common | {"backend"}:
+            return False
+    elif set(value) != common:
         return False
     if value["action"] not in ("pause", "resource"):
         return False
@@ -1169,6 +1174,17 @@ def _valid_runtime_entry(value):
     if not isinstance(value["original"], dict) or not isinstance(value["owned"], dict):
         return False
     if value["action"] == "pause":
+        if value["backend"] not in ("process", "systemd"):
+            return False
+        if value["backend"] == "systemd":
+            return (
+                bool(value["unit"])
+                and not value["unit"].startswith("-")
+                and "/" not in value["unit"]
+                and value["unit"].endswith((".scope", ".service"))
+                and value["original"] == {"state": "running"}
+                and value["owned"] == {"state": "frozen"}
+            )
         return (
             value["original"] == {"state": "running"}
             and value["owned"] == {"state": "stopped"}
@@ -1286,6 +1302,13 @@ class MemoryJournal:
         self.journal = current
         return True
 
+    def replace_entries(self, entries):
+        current = {"version": RUNTIME_JOURNAL_VERSION, "entries": list(entries)}
+        if not _valid_runtime_journal(current):
+            return False
+        self.journal = current
+        return True
+
 
 class RuntimeJournal:
     """Persistent journal adapter shared by action and resource controllers."""
@@ -1304,6 +1327,12 @@ class RuntimeJournal:
             entry for entry in current["entries"] if entry["action"] != action
         ] + list(entries)
         return save_runtime_journal(self.path, current)
+
+    def replace_entries(self, entries):
+        return save_runtime_journal(
+            self.path,
+            {"version": RUNTIME_JOURNAL_VERSION, "entries": list(entries)},
+        )
 
 
 def _identity_data(identity):
@@ -1327,6 +1356,26 @@ def _current_user_identity(identity, source=None, uid=None):
         )
     except OSError:
         return False
+
+
+def _process_state(identity, source=None):
+    """Return the current procfs state for one exact identity, or ``""``."""
+    if not same_process(identity, source=source):
+        return ""
+    try:
+        if source is not None and hasattr(source, "state"):
+            value = source.state(identity.pid)
+            return value if isinstance(value, str) and len(value) == 1 else ""
+        with open(os.path.join("/proc", str(identity.pid), "stat"), encoding="utf-8") as fh:
+            raw = fh.read()
+        fields = raw[raw.rfind(")") + 2:].split()
+        return fields[0] if fields else ""
+    except (AttributeError, OSError, TypeError, ValueError):
+        return ""
+
+
+def _is_stopped_state(state):
+    return state in ("T", "t")
 
 
 def _default_runner(command):
@@ -1456,37 +1505,74 @@ def _restore_resource_entry(entry, runner, source):
     return restored, changed
 
 
-def restore_from_journal(path=None, runner=None, source=None):
-    """Idempotently restore only values still owned by this optimizer instance."""
+def restore_from_journal(path=None, runner=None, source=None, journal=None,
+                         send_signal=None):
+    """Idempotently restore only still-owned resource and pause transitions."""
     path = path or runtime_journal_path()
-    journal, capability = load_runtime_journal(path)
+    if journal is None:
+        data, capability = load_runtime_journal(path)
+        replace_entries = lambda entries: save_runtime_journal(
+            path, {"version": RUNTIME_JOURNAL_VERSION, "entries": entries})
+    else:
+        data, capability = journal.load()
+        replace_entries = journal.replace_entries
     if capability.level == "unavailable":
         return (capability,)
     runner = runner or _default_runner
+    send_signal = send_signal or (lambda identity, signum: os.kill(identity.pid, signum))
     retained = []
     changed = False
-    for entry in journal["entries"]:
+    for entry in data["entries"]:
         if entry["action"] == "pause":
-            identity_results = []
-            for data in entry["identities"]:
-                identity = _identity_from_data(data)
+            identities = tuple(_identity_from_data(value) for value in entry["identities"])
+            if entry["backend"] == "systemd":
+                if not all(_current_user_identity(identity, source=source)
+                           for identity in identities):
+                    # A reused unit cannot be thawed safely without the original
+                    # identity proof; retain the durable entry for a later retry.
+                    retained.append(entry)
+                    continue
+                thawed, _output = _run_probe(
+                    runner, ("systemctl", "--user", "thaw", entry["unit"]))
+                if thawed:
+                    changed = True
+                else:
+                    retained.append(entry)
+                continue
+            remaining = []
+            for identity in identities:
                 if not _current_user_identity(identity, source=source):
                     changed = True
                     continue
-                try:
-                    os.kill(identity.pid, signal.SIGCONT)
+                state = _process_state(identity, source=source)
+                if not _is_stopped_state(state):
+                    # The process was resumed by another actor; relinquish it.
                     changed = True
+                    continue
+                try:
+                    result = send_signal(identity, signal.SIGCONT)
+                    if result is False:
+                        remaining.append(_identity_data(identity))
+                    else:
+                        changed = True
                 except OSError:
-                    identity_results.append(data)
-            if identity_results:
-                retained.append(dict(entry, identities=identity_results))
+                    remaining.append(_identity_data(identity))
+            if remaining:
+                retained.append(dict(entry, identities=remaining))
             continue
         restored, entry_changed = _restore_resource_entry(entry, runner, source)
         changed |= entry_changed
         if restored is not None:
             retained.append(restored)
     if changed:
-        save_runtime_journal(path, {"version": RUNTIME_JOURNAL_VERSION, "entries": retained})
+        try:
+            persisted = replace_entries(retained)
+        except Exception:
+            persisted = False
+        if persisted is False:
+            return (Capability(
+                "journal", "unavailable", "Runtime journal persistence pending",
+            ),)
     return (Capability(
         "journal", "full" if not retained else "unavailable",
         "Runtime journal restored" if not retained else "Runtime journal restore pending",
@@ -1505,6 +1591,7 @@ class PausedGroup:
     unit: str
     identities: Tuple[ProcessIdentity, ...]
     backend: str
+    pause_token: str = ""
 
 
 class AppController:
@@ -1512,7 +1599,7 @@ class AppController:
 
     def __init__(self, runner, uid=os.getuid(), source=None, send_signal=None,
                  desktop_close=None, clock=None, sleeper=None, journal=None,
-                 journal_path=None, lease=None):
+                 journal_path=None, lease=None, groups_provider=None):
         self.runner = runner
         self.uid = uid
         self.source = source
@@ -1521,9 +1608,10 @@ class AppController:
         self.clock = clock or time.monotonic
         self.sleeper = sleeper or time.sleep
         self.journal = journal or RuntimeJournal(journal_path)
-        self.lease = lease
+        self.lease = lease if lease is not None else GuardLease()
+        self.groups_provider = groups_provider
         self.paused = {}
-        self._deep_focus_keys = set()
+        self._deep_focus_tokens = {}
         self._deep_focus_active = False
         self._end_tokens = {}
 
@@ -1537,20 +1625,77 @@ class AppController:
         os.kill(identity.pid, signum)
         return True
 
-    def _group_identities(self, group):
+    def _group_identities(self, group, require_running=False):
         return tuple(
             process.identity for process in group.processes
-            if process.uid == self.uid and self._current(process.identity)
+            if (process.uid == self.uid and self._current(process.identity)
+                and (not require_running
+                     or not _is_stopped_state(_process_state(process.identity, self.source))))
         )
 
-    def _exact_unit(self, group, identities):
+    def _known_groups(self, known_groups=None):
+        if known_groups is not None:
+            return tuple(known_groups)
+        if self.groups_provider is None:
+            return ()
+        try:
+            return tuple(self.groups_provider())
+        except Exception:
+            return ()
+
+    def _exact_unit(self, group, identities, known_groups=None):
         return (
             bool(group.unit)
             and not group.unit.startswith("-")
             and "/" not in group.unit
             and group.unit.endswith((".scope", ".service"))
             and len(identities) == len(group.processes)
+            and self._exclusive_unit(group, identities, known_groups)
         )
+
+    def _exclusive_unit(self, group, identities, known_groups):
+        if self.groups_provider is None:
+            return False
+        # A caller's display snapshot can be stale; only the current discovery
+        # provider may authorize a unit-wide transition.
+        del known_groups
+        groups = self._known_groups()
+        members = tuple(candidate for candidate in groups if candidate.unit == group.unit)
+        if len(members) != 1:
+            return False
+        candidate = members[0]
+        return (
+            candidate.key == group.key
+            and candidate.managed
+            and tuple(process.identity for process in candidate.processes) == identities
+            and all(process.uid == self.uid and self._current(process.identity)
+                    for process in candidate.processes)
+        )
+
+    def _exclusive_paused_unit(self, paused):
+        if self.groups_provider is None:
+            return False
+        groups = self._known_groups()
+        members = tuple(candidate for candidate in groups if candidate.unit == paused.unit)
+        return (
+            len(members) == 1
+            and members[0].key == paused.group_key
+            and members[0].managed
+            and tuple(process.identity for process in members[0].processes) == paused.identities
+            and all(process.uid == self.uid and self._current(process.identity)
+                    for process in members[0].processes)
+        )
+
+    def _unit_freezer_state(self, unit):
+        ok, output = self._run(("systemctl", "--user", "show", unit,
+                                "--property=FreezerState"))
+        if not ok:
+            return ""
+        for line in output.splitlines():
+            name, separator, value = line.partition("=")
+            if name == "FreezerState" and separator:
+                return value.strip()
+        return ""
 
     def _denied(self, action, group):
         if _action_allowed(group):
@@ -1571,57 +1716,115 @@ class AppController:
             return False
 
     def _sync_pause_journal(self):
+        return self._write_pause_records(self.paused)
+
+    def _write_pause_records(self, records):
         entries = []
-        for paused in self.paused.values():
+        for paused in records.values():
             entries.append({
                 "action": "pause",
                 "group_key": paused.group_key,
                 "identities": [_identity_data(identity) for identity in paused.identities],
                 "unit": paused.unit,
+                "backend": paused.backend,
                 "original": {"state": "running"},
-                "owned": {"state": "stopped"},
+                "owned": {"state": "frozen" if paused.backend == "systemd" else "stopped"},
             })
-        self.journal.replace_action("pause", entries)
+        try:
+            return self.journal.replace_action("pause", entries) is not False
+        except Exception:
+            return False
 
-    def _track(self, identities):
-        if self.lease is None:
-            return
+    def _track(self, identities, backend, unit):
+        tracked = []
         for identity in identities:
-            self.lease.track(identity)
+            try:
+                if self.lease.track(identity, backend=backend, unit=unit) is False:
+                    self._untrack(tracked)
+                    return False
+            except (AttributeError, OSError):
+                self._untrack(tracked)
+                return False
+            tracked.append(identity)
+        return True
 
     def _untrack(self, identities):
-        if self.lease is None:
-            return
         for identity in identities:
-            self.lease.untrack(identity)
+            try:
+                self.lease.untrack(identity)
+            except (AttributeError, OSError):
+                pass
 
-    def pause(self, group):
+    def _record_pause(self, group, identities, backend):
+        return PausedGroup(
+            group.key, group.unit, tuple(identities), backend,
+            secrets.token_urlsafe(24),
+        )
+
+    def _prepare_pause(self, record):
+        if not self._track(record.identities, record.backend, record.unit):
+            return False
+        pending = dict(self.paused)
+        pending[record.group_key] = record
+        if self._write_pause_records(pending):
+            return True
+        self._untrack(record.identities)
+        return False
+
+    def _abandon_prepared_pause(self, record):
+        self._untrack(record.identities)
+        self._sync_pause_journal()
+
+    def pause(self, group, known_groups=None):
         denied = self._denied("pause", group)
         if denied is not None:
             return denied
         if group.key in self.paused:
             return ActionResult("pause", group.key, 0, 0, detail="Group is already paused")
-        identities = self._group_identities(group)
+        identities = self._group_identities(group, require_running=True)
         if not identities:
             return ActionResult("pause", group.key, 0, 0, detail="No current identities to pause")
         backend = "process"
-        changed = ()
-        if self._exact_unit(group, identities):
+        valid_unit = (
+            bool(group.unit)
+            and not group.unit.startswith("-")
+            and "/" not in group.unit
+            and group.unit.endswith((".scope", ".service"))
+        )
+        if valid_unit:
+            freezer_state = self._unit_freezer_state(group.unit)
+            if freezer_state in ("frozen", "freezing"):
+                return ActionResult("pause", group.key, 0, 0,
+                                    detail="Unit is already frozen by another actor")
+            if freezer_state != "running":
+                return ActionResult("pause", group.key, 0, 0,
+                                    detail="Unit freezer state is unavailable")
+            if self._exact_unit(group, identities, known_groups):
+                backend = "systemd"
+        record = self._record_pause(group, identities, backend)
+        if not self._prepare_pause(record):
+            return ActionResult("pause", group.key, 0, 0,
+                                detail="Pause guard or journal registration unavailable")
+        if backend == "systemd":
             frozen, _output = self._run(("systemctl", "--user", "freeze", group.unit))
             if frozen:
-                backend = "systemd"
-                changed = identities
-        if not changed:
-            changed = tuple(
-                identity for identity in identities
-                if self._signal(identity, signal.SIGSTOP)
-            )
-        if changed:
-            self.paused[group.key] = PausedGroup(group.key, group.unit, changed, backend)
-            self._track(changed)
-            self._sync_pause_journal()
-        return ActionResult("pause", group.key, len(changed), 0,
-                            detail="Paused" if changed else "No current identities were paused")
+                self.paused[group.key] = record
+                return ActionResult("pause", group.key, len(identities), 0, detail="Paused")
+            self._abandon_prepared_pause(record)
+            return ActionResult("pause", group.key, 0, 0, detail="Unit freeze unavailable")
+        changed = []
+        for identity in identities:
+            if (not self._current(identity)
+                    or _is_stopped_state(_process_state(identity, self.source))
+                    or not self._signal(identity, signal.SIGSTOP)):
+                for paused_identity in changed:
+                    self._signal(paused_identity, signal.SIGCONT)
+                self._abandon_prepared_pause(record)
+                return ActionResult("pause", group.key, 0, 0,
+                                    detail="Pause could not establish exact ownership")
+            changed.append(identity)
+        self.paused[group.key] = record
+        return ActionResult("pause", group.key, len(changed), 0, detail="Paused")
 
     def resume(self, group_key):
         paused = self.paused.get(group_key)
@@ -1629,44 +1832,93 @@ class AppController:
             return ActionResult("resume", group_key, 0, 0, detail="Group is not paused by this controller")
         current = tuple(identity for identity in paused.identities if self._current(identity))
         changed = ()
-        if paused.backend == "systemd" and len(current) == len(paused.identities):
+        removed = tuple(identity for identity in paused.identities if identity not in current)
+        if (paused.backend == "systemd" and len(current) == len(paused.identities)
+                and self._exclusive_paused_unit(paused)):
             thawed, _output = self._run(("systemctl", "--user", "thaw", paused.unit))
             if thawed:
                 changed = current
-        if not changed:
-            changed = tuple(
-                identity for identity in current if self._signal(identity, signal.SIGCONT)
-            )
-        remaining = tuple(identity for identity in paused.identities if identity not in changed)
+            else:
+                # A cgroup freezer is not undone by SIGCONT; preserve ownership.
+                return ActionResult("resume", group_key, 0, len(paused.identities),
+                                    detail="Unit thaw pending")
+        elif paused.backend == "systemd":
+            # Cannot prove an old unit is still the same application. Keep the
+            # durable unit transition rather than waking a potentially reused unit.
+            return ActionResult("resume", group_key, 0, len(paused.identities),
+                                detail="Unit thaw identity proof pending")
+        else:
+            resumed = []
+            for identity in current:
+                if not _is_stopped_state(_process_state(identity, self.source)):
+                    removed += (identity,)
+                elif self._signal(identity, signal.SIGCONT):
+                    resumed.append(identity)
+                else:
+                    continue
+            changed = tuple(resumed)
+        remaining = tuple(identity for identity in paused.identities
+                          if identity not in changed and identity not in removed)
+        self._untrack(tuple(identity for identity in paused.identities
+                            if identity not in remaining))
         if remaining:
             self.paused[group_key] = PausedGroup(
-                paused.group_key, paused.unit, remaining, paused.backend)
+                paused.group_key, paused.unit, remaining, paused.backend, paused.pause_token)
         else:
             self.paused.pop(group_key, None)
-        self._untrack(changed)
-        self._sync_pause_journal()
+        journal_synced = self._sync_pause_journal()
+        if self._deep_focus_tokens.get(group_key) == paused.pause_token and not remaining:
+            self._deep_focus_tokens.pop(group_key, None)
+        detail = "Resumed" if changed else "No current identities were resumed"
+        if not journal_synced:
+            detail = "%s; journal persistence pending" % detail
         return ActionResult("resume", group_key, len(changed), len(remaining),
-                            detail="Resumed" if changed else "No current identities were resumed")
+                            detail=detail)
 
     def set_deep_focus(self, groups, enabled):
         if enabled:
             if not self._deep_focus_active:
-                self._deep_focus_keys = set()
+                self._deep_focus_tokens = {}
                 self._deep_focus_active = True
             results = []
             for group in groups:
                 if group.role != Role.BACKGROUND:
                     continue
                 already_paused = group.key in self.paused
-                result = self.pause(group)
+                result = self.pause(group, known_groups=groups)
                 results.append(result)
                 if not already_paused and group.key in self.paused:
-                    self._deep_focus_keys.add(group.key)
+                    self._deep_focus_tokens[group.key] = self.paused[group.key].pause_token
             return tuple(results)
-        results = tuple(self.resume(key) for key in tuple(self._deep_focus_keys))
-        self._deep_focus_keys.clear()
+        results = []
+        for key, token in tuple(self._deep_focus_tokens.items()):
+            paused = self.paused.get(key)
+            if paused is not None and paused.pause_token == token:
+                results.append(self.resume(key))
+        self._deep_focus_tokens.clear()
         self._deep_focus_active = False
-        return results
+        return tuple(results)
+
+    def restore_interrupted(self):
+        """Recover this controller's journal through its injected safe backends."""
+        result = restore_from_journal(
+            runner=self.runner,
+            source=self.source,
+            journal=self.journal,
+            send_signal=self._signal,
+        )
+        current, _capability = self.journal.load()
+        restored = {}
+        for entry in current["entries"]:
+            if entry["action"] != "pause":
+                continue
+            identities = tuple(_identity_from_data(value) for value in entry["identities"])
+            restored[entry["group_key"]] = PausedGroup(
+                entry["group_key"], entry["unit"], identities, entry["backend"])
+        self.paused = restored
+        self._deep_focus_tokens.clear()
+        self._deep_focus_active = False
+        return result
 
     def _wait_for_survivors(self, identities):
         deadline = self.clock() + 3.0
@@ -1691,10 +1943,6 @@ class AppController:
                     changed = identities
             except Exception:
                 pass
-        elif self._exact_unit(group, identities):
-            stopped, _output = self._run(("systemctl", "--user", "stop", group.unit))
-            if stopped:
-                changed = identities
         if not changed:
             changed = tuple(
                 identity for identity in identities if self._signal(identity, signal.SIGTERM)
@@ -1771,8 +2019,14 @@ class GuardLease:
         except (BrokenPipeError, OSError):
             return False
 
-    def track(self, identity):
-        return self._write(dict({"op": "track"}, **_identity_data(identity)))
+    def track(self, identity, backend="process", unit=""):
+        """Register an exact pause identity before the controller mutates it."""
+        if backend not in ("process", "systemd") or not isinstance(unit, str):
+            return False
+        return self._write(dict(
+            {"op": "track", "backend": backend, "unit": unit},
+            **_identity_data(identity),
+        ))
 
     def untrack(self, identity):
         return self._write(dict({"op": "untrack"}, **_identity_data(identity)))
