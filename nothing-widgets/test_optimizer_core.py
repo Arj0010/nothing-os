@@ -133,6 +133,8 @@ class FakeRunner:
                 or any(command[:len(prefix)] == prefix for prefix in self.fail_prefixes)):
             return False, ""
         value = self.responses.get(command)
+        if isinstance(value, list):
+            value = value.pop(0) if value else ""
         if value is None and command[:3] == ("systemctl", "--user", "show") \
                 and command[-1:] == ("--property=FreezerState",):
             value = "FreezerState=running"
@@ -1140,6 +1142,35 @@ class AppControllerTest(unittest.TestCase):
         self.assertIn(group.key, controller.paused)
         self.assertNotIn(("systemctl", "--user", "thaw", unit), runner.commands)
 
+    def test_restore_interrupted_does_not_thaw_a_unit_with_a_primary_sibling(self):
+        unit = "app-recovery-shared.scope"
+        group = replace(group_with_role(oc.Role.BACKGROUND), unit=unit)
+        sibling = replace(group_with_role(oc.Role.PRIMARY), unit=unit)
+        identity = group.processes[0].identity
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause",
+                "group_key": group.key,
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": unit,
+                "backend": "systemd",
+                "original": {"state": "running"},
+                "owned": {"state": "frozen"},
+            }],
+        })
+        runner = FakeRunner()
+        controller = controller_with_fakes(
+            runner=runner,
+            journal=journal,
+            source=CurrentFakeProcessSource({identity.pid: identity.start_time}),
+            groups_provider=lambda: (group, sibling),
+        )
+        self.assertEqual(controller.restore_interrupted()[0].level, "unavailable")
+        self.assertNotIn(("systemctl", "--user", "thaw", unit), runner.commands)
+        entries, _capability = journal.load()
+        self.assertEqual(len(entries["entries"]), 1)
+
     def test_pause_never_claims_an_already_frozen_unit(self):
         group = group_with_role(oc.Role.BACKGROUND)
         freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
@@ -1182,6 +1213,151 @@ class AppControllerTest(unittest.TestCase):
         self.assertEqual(controller.pause(group).changed, 0)
         self.assertNotIn(group.key, controller.paused)
         self.assertEqual(controller.signal_records, [])
+
+    def test_pause_refuses_an_unknown_process_state(self):
+        group = group_with_role(oc.Role.BACKGROUND, unit="")
+        identity = group.processes[0].identity
+        source = CurrentFakeProcessSource(
+            {identity.pid: identity.start_time}, {identity.pid: None})
+        controller = controller_with_fakes(source=source)
+        self.assertEqual(controller.pause(group).changed, 0)
+        self.assertNotIn(group.key, controller.paused)
+        self.assertEqual(controller.signal_records, [])
+
+    def test_resume_retains_an_unknown_process_state(self):
+        group = group_with_role(oc.Role.BACKGROUND, unit="")
+        identity = group.processes[0].identity
+        source = CurrentFakeProcessSource(
+            {identity.pid: identity.start_time}, {identity.pid: None})
+        controller = controller_with_fakes(source=source)
+        controller.paused[group.key] = oc.PausedGroup(
+            group.key, "", (identity,), "process")
+        result = controller.resume(group.key)
+        self.assertEqual(result.survived, 1)
+        self.assertIn(group.key, controller.paused)
+        self.assertEqual(controller.signal_records, [])
+
+    def test_resume_discards_all_stale_unit_identities_and_allows_repause(self):
+        unit = "app-stale-unit.scope"
+        group = replace(group_with_role(oc.Role.BACKGROUND), unit=unit)
+        identity = group.processes[0].identity
+        source = CurrentFakeProcessSource({identity.pid: identity.start_time})
+        lease = FakeLease()
+        groups = [group]
+        runner = FakeRunner({
+            ("systemctl", "--user", "show", unit, "--property=FreezerState"):
+                "FreezerState=running",
+        })
+        controller = controller_with_fakes(
+            runner=runner, source=source, lease=lease,
+            groups_provider=lambda: tuple(groups),
+        )
+        self.assertEqual(controller.pause(group).changed, 1)
+        source.start_times[identity.pid] = identity.start_time + 1
+        self.assertEqual(controller.resume(group.key).survived, 0)
+        self.assertNotIn(group.key, controller.paused)
+        self.assertIn(identity, lease.untracked)
+        entries, _capability = controller.journal.load()
+        self.assertEqual(entries["entries"], [])
+        replacement_identity = oc.ProcessIdentity(identity.pid, identity.start_time + 1)
+        source.states[identity.pid] = "R"
+        replacement = replace(group, processes=(replace(
+            group.processes[0], identity=replacement_identity),))
+        groups[:] = [replacement]
+        self.assertEqual(controller.pause(replacement).changed, 1)
+
+    def test_partial_pause_rollback_retains_a_still_stopped_identity(self):
+        first = proc(9101, 1, "test-app", "/usr/bin/test-app", "", uid=1000)
+        second = proc(9102, 1, "test-app", "/usr/bin/test-app", "", uid=1000)
+        group = oc.AppGroup("rollback", "Rollback", oc.Role.BACKGROUND,
+                            (first, second), unit="")
+        states = {first.identity.pid: "R", second.identity.pid: "R"}
+        source = CurrentFakeProcessSource({
+            first.identity.pid: first.identity.start_time,
+            second.identity.pid: second.identity.start_time,
+        }, states)
+        signals = []
+
+        def send_signal(identity, signum):
+            signals.append((identity, signum))
+            if identity == first.identity and signum == signal.SIGSTOP:
+                states[identity.pid] = "T"
+                return True
+            if identity == second.identity and signum == signal.SIGSTOP:
+                return False
+            if identity == first.identity and signum == signal.SIGCONT:
+                return False
+            return True
+
+        lease = FakeLease()
+        journal = oc.MemoryJournal()
+        controller = oc.AppController(
+            runner=FakeRunner(), uid=1000, source=source, journal=journal,
+            lease=lease, send_signal=send_signal,
+        )
+        result = controller.pause(group)
+        self.assertEqual(result.changed, 0)
+        self.assertEqual(result.survived, 1)
+        self.assertEqual(controller.paused[group.key].identities, (first.identity,))
+        self.assertIn((first.identity, signal.SIGCONT), signals)
+        self.assertNotIn(first.identity, lease.untracked)
+        self.assertIn(second.identity, lease.untracked)
+        entries, _capability = journal.load()
+        self.assertEqual(entries["entries"][0]["identities"], [
+            {"pid": first.identity.pid, "start_time": first.identity.start_time},
+        ])
+
+    def test_uncertain_freeze_retains_the_prepared_recovery_record(self):
+        group = group_with_role(oc.Role.BACKGROUND)
+        freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
+        runner = FakeRunner(
+            {freezer: ["FreezerState=running", "FreezerState=frozen"]},
+            fail_prefixes={("systemctl", "--user", "freeze")},
+        )
+        lease = FakeLease()
+        controller = controller_with_fakes(
+            runner=runner, lease=lease, groups_provider=lambda: (group,))
+        result = controller.pause(group)
+        self.assertEqual(result.changed, 0)
+        self.assertEqual(result.survived, 1)
+        self.assertIn(group.key, controller.paused)
+        self.assertNotIn(group.processes[0].identity, lease.untracked)
+        entries, _capability = controller.journal.load()
+        self.assertEqual(entries["entries"][0]["backend"], "systemd-uncertain")
+
+    def test_uncertain_freeze_recovery_never_thaws_an_unconfirmed_unit(self):
+        group = group_with_role(oc.Role.BACKGROUND)
+        freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
+        runner = FakeRunner(
+            {freezer: ["FreezerState=running", "FreezerState=frozen"]},
+            fail_prefixes={("systemctl", "--user", "freeze")},
+        )
+        controller = controller_with_fakes(
+            runner=runner, lease=FakeLease(), groups_provider=lambda: (group,))
+        self.assertEqual(controller.pause(group).survived, 1)
+
+        result = controller.restore_interrupted()
+
+        self.assertEqual(result[0].level, "unavailable")
+        self.assertNotIn(("systemctl", "--user", "thaw", group.unit), runner.commands)
+        entries, _capability = controller.journal.load()
+        self.assertEqual(entries["entries"][0]["backend"], "systemd-uncertain")
+
+    def test_confirmed_running_after_failed_freeze_clears_the_prepared_record(self):
+        group = group_with_role(oc.Role.BACKGROUND)
+        freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
+        runner = FakeRunner(
+            {freezer: ["FreezerState=running", "FreezerState=running"]},
+            fail_prefixes={("systemctl", "--user", "freeze")},
+        )
+        lease = FakeLease()
+        controller = controller_with_fakes(
+            runner=runner, lease=lease, groups_provider=lambda: (group,))
+        self.assertEqual(controller.pause(group).changed, 0)
+        self.assertNotIn(group.key, controller.paused)
+        self.assertIn(group.processes[0].identity, lease.untracked)
+        entries, _capability = controller.journal.load()
+        self.assertEqual(entries["entries"], [])
 
     def test_actions_skip_a_reused_process_identity_before_any_signal(self):
         group = group_with_role(oc.Role.BACKGROUND, unit="")
@@ -1400,6 +1576,12 @@ class RuntimeJournalTest(unittest.TestCase):
 
     def test_restore_from_journal_thaws_owned_cgroup_pause_without_sigcont(self):
         identity = oc.ProcessIdentity(323, 32300)
+        group = oc.AppGroup(
+            "test", "Test", oc.Role.BACKGROUND,
+            (proc(323, 1, "test-app", "/usr/bin/test-app", "/user/app-test.scope",
+                  start=32300),),
+            unit="app-test.scope",
+        )
         journal = oc.MemoryJournal({
             "version": 1,
             "entries": [{
@@ -1419,6 +1601,7 @@ class RuntimeJournalTest(unittest.TestCase):
             source=CurrentFakeProcessSource({323: 32300}),
             journal=journal,
             send_signal=lambda process, signum: signals.append((process, signum)) or True,
+            groups_provider=lambda: (group,),
         )
         self.assertEqual(result[0].level, "unavailable")
         self.assertIn(("systemctl", "--user", "thaw", "app-test.scope"), runner.commands)
@@ -1431,12 +1614,69 @@ class RuntimeJournalTest(unittest.TestCase):
             source=CurrentFakeProcessSource({323: 32300}),
             journal=journal,
             send_signal=lambda process, signum: signals.append((process, signum)) or True,
+            groups_provider=lambda: (group,),
         )[0].level, "full")
+        entries, _capability = journal.load()
+        self.assertEqual(entries["entries"], [])
+
+    def test_journal_restore_retains_an_unknown_process_state(self):
+        identity = oc.ProcessIdentity(325, 32500)
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause",
+                "group_key": "test",
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "",
+                "backend": "process",
+                "original": {"state": "running"},
+                "owned": {"state": "stopped"},
+            }],
+        })
+        signals = []
+        result = oc.restore_from_journal(
+            runner=FakeRunner(),
+            source=CurrentFakeProcessSource({325: 32500}, {325: None}),
+            journal=journal,
+            send_signal=lambda identity, signum: signals.append((identity, signum)) or True,
+        )
+        self.assertEqual(result[0].level, "unavailable")
+        self.assertEqual(signals, [])
+        entries, _capability = journal.load()
+        self.assertEqual(len(entries["entries"]), 1)
+
+    def test_journal_restore_discards_all_stale_unit_pause_identities(self):
+        identity = oc.ProcessIdentity(326, 32600)
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause",
+                "group_key": "test",
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "app-test.scope",
+                "backend": "systemd",
+                "original": {"state": "running"},
+                "owned": {"state": "frozen"},
+            }],
+        })
+        result = oc.restore_from_journal(
+            runner=FakeRunner(),
+            source=CurrentFakeProcessSource({326: 32601}),
+            journal=journal,
+            groups_provider=lambda: (),
+        )
+        self.assertEqual(result[0].level, "full")
         entries, _capability = journal.load()
         self.assertEqual(entries["entries"], [])
 
     def test_thaw_reports_degradation_when_the_journal_cannot_clear(self):
         identity = oc.ProcessIdentity(324, 32400)
+        group = oc.AppGroup(
+            "test", "Test", oc.Role.BACKGROUND,
+            (proc(324, 1, "test-app", "/usr/bin/test-app", "/user/app-test.scope",
+                  start=32400),),
+            unit="app-test.scope",
+        )
         journal = FailingReplaceJournal({
             "version": 1,
             "entries": [{
@@ -1453,6 +1693,7 @@ class RuntimeJournalTest(unittest.TestCase):
             runner=FakeRunner(),
             source=CurrentFakeProcessSource({324: 32400}),
             journal=journal,
+            groups_provider=lambda: (group,),
         )
         self.assertEqual(result[0].level, "unavailable")
         entries, _capability = journal.load()

@@ -42,7 +42,7 @@ def main(stdin=None):
                     continue
                 backend = message.get("backend", "process")
                 unit = message.get("unit", "")
-                if backend not in ("process", "systemd") or not isinstance(unit, str):
+                if backend not in ("process", "systemd", "systemd-uncertain") or not isinstance(unit, str):
                     continue
                 tracked[identity] = (backend, unit)
             elif operation == "untrack" and set(message) == {"op", "pid", "start_time"}:

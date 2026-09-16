@@ -1174,9 +1174,9 @@ def _valid_runtime_entry(value):
     if not isinstance(value["original"], dict) or not isinstance(value["owned"], dict):
         return False
     if value["action"] == "pause":
-        if value["backend"] not in ("process", "systemd"):
+        if value["backend"] not in ("process", "systemd", "systemd-uncertain"):
             return False
-        if value["backend"] == "systemd":
+        if value["backend"] in ("systemd", "systemd-uncertain"):
             return (
                 bool(value["unit"])
                 and not value["unit"].startswith("-")
@@ -1378,6 +1378,30 @@ def _is_stopped_state(state):
     return state in ("T", "t")
 
 
+def _exclusive_managed_unit(group_key, unit, identities, groups_provider,
+                            source=None, uid=None):
+    """Prove that a current discovery snapshot still owns one whole user unit."""
+    if groups_provider is None:
+        return False
+    try:
+        groups = tuple(groups_provider())
+    except Exception:
+        return False
+    members = tuple(group for group in groups if group.unit == unit)
+    if len(members) != 1:
+        return False
+    group = members[0]
+    expected_uid = os.getuid() if uid is None else uid
+    return (
+        group.key == group_key
+        and group.managed
+        and tuple(process.identity for process in group.processes) == tuple(identities)
+        and all(process.uid == expected_uid
+                and _current_user_identity(process.identity, source=source, uid=expected_uid)
+                for process in group.processes)
+    )
+
+
 def _default_runner(command):
     try:
         completed = subprocess.run(
@@ -1506,7 +1530,7 @@ def _restore_resource_entry(entry, runner, source):
 
 
 def restore_from_journal(path=None, runner=None, source=None, journal=None,
-                         send_signal=None):
+                         send_signal=None, groups_provider=None, uid=None):
     """Idempotently restore only still-owned resource and pause transitions."""
     path = path or runtime_journal_path()
     if journal is None:
@@ -1525,11 +1549,28 @@ def restore_from_journal(path=None, runner=None, source=None, journal=None,
     for entry in data["entries"]:
         if entry["action"] == "pause":
             identities = tuple(_identity_from_data(value) for value in entry["identities"])
+            if entry["backend"] == "systemd-uncertain":
+                # The freezer request did not acknowledge completion.  Its
+                # journal intent is deliberately durable, but is not proof
+                # that this controller caused a frozen unit, so never thaw it.
+                retained.append(entry)
+                continue
             if entry["backend"] == "systemd":
-                if not all(_current_user_identity(identity, source=source)
-                           for identity in identities):
-                    # A reused unit cannot be thawed safely without the original
-                    # identity proof; retain the durable entry for a later retry.
+                current = tuple(
+                    identity for identity in identities
+                    if _current_user_identity(identity, source=source, uid=uid)
+                )
+                if not current:
+                    # The unit is no longer inhabited by an identity we paused.
+                    # It cannot be safely attributed or thawed, so relinquish it.
+                    changed = True
+                    continue
+                if (len(current) != len(identities)
+                        or not _exclusive_managed_unit(
+                            entry["group_key"], entry["unit"], identities,
+                            groups_provider, source=source, uid=uid)):
+                    # A reused or now-shared unit cannot be thawed safely without
+                    # the same current exclusive ownership proof used by Resume.
                     retained.append(entry)
                     continue
                 thawed, _output = _run_probe(
@@ -1545,6 +1586,10 @@ def restore_from_journal(path=None, runner=None, source=None, journal=None,
                     changed = True
                     continue
                 state = _process_state(identity, source=source)
+                if not state:
+                    # Unreadable proc state is uncertainty, not an external resume.
+                    remaining.append(_identity_data(identity))
+                    continue
                 if not _is_stopped_state(state):
                     # The process was resumed by another actor; relinquish it.
                     changed = True
@@ -1626,12 +1671,15 @@ class AppController:
         return True
 
     def _group_identities(self, group, require_running=False):
-        return tuple(
-            process.identity for process in group.processes
-            if (process.uid == self.uid and self._current(process.identity)
-                and (not require_running
-                     or not _is_stopped_state(_process_state(process.identity, self.source))))
-        )
+        identities = []
+        for process in group.processes:
+            if process.uid != self.uid or not self._current(process.identity):
+                continue
+            state = _process_state(process.identity, self.source)
+            if require_running and (not state or _is_stopped_state(state)):
+                continue
+            identities.append(process.identity)
+        return tuple(identities)
 
     def _known_groups(self, known_groups=None):
         if known_groups is not None:
@@ -1659,32 +1707,14 @@ class AppController:
         # A caller's display snapshot can be stale; only the current discovery
         # provider may authorize a unit-wide transition.
         del known_groups
-        groups = self._known_groups()
-        members = tuple(candidate for candidate in groups if candidate.unit == group.unit)
-        if len(members) != 1:
-            return False
-        candidate = members[0]
-        return (
-            candidate.key == group.key
-            and candidate.managed
-            and tuple(process.identity for process in candidate.processes) == identities
-            and all(process.uid == self.uid and self._current(process.identity)
-                    for process in candidate.processes)
-        )
+        return _exclusive_managed_unit(
+            group.key, group.unit, identities, self.groups_provider,
+            source=self.source, uid=self.uid)
 
     def _exclusive_paused_unit(self, paused):
-        if self.groups_provider is None:
-            return False
-        groups = self._known_groups()
-        members = tuple(candidate for candidate in groups if candidate.unit == paused.unit)
-        return (
-            len(members) == 1
-            and members[0].key == paused.group_key
-            and members[0].managed
-            and tuple(process.identity for process in members[0].processes) == paused.identities
-            and all(process.uid == self.uid and self._current(process.identity)
-                    for process in members[0].processes)
-        )
+        return _exclusive_managed_unit(
+            paused.group_key, paused.unit, paused.identities, self.groups_provider,
+            source=self.source, uid=self.uid)
 
     def _unit_freezer_state(self, unit):
         ok, output = self._run(("systemctl", "--user", "show", unit,
@@ -1728,7 +1758,8 @@ class AppController:
                 "unit": paused.unit,
                 "backend": paused.backend,
                 "original": {"state": "running"},
-                "owned": {"state": "frozen" if paused.backend == "systemd" else "stopped"},
+                "owned": {"state": "frozen" if paused.backend in (
+                    "systemd", "systemd-uncertain") else "stopped"},
             })
         try:
             return self.journal.replace_action("pause", entries) is not False
@@ -1800,25 +1831,59 @@ class AppController:
                 return ActionResult("pause", group.key, 0, 0,
                                     detail="Unit freezer state is unavailable")
             if self._exact_unit(group, identities, known_groups):
-                backend = "systemd"
+                # Persist intent as uncertain before the non-transactional
+                # freezer request.  Only its successful acknowledgement is
+                # promoted to controller-owned recovery state.
+                backend = "systemd-uncertain"
         record = self._record_pause(group, identities, backend)
         if not self._prepare_pause(record):
             return ActionResult("pause", group.key, 0, 0,
                                 detail="Pause guard or journal registration unavailable")
-        if backend == "systemd":
+        if backend == "systemd-uncertain":
             frozen, _output = self._run(("systemctl", "--user", "freeze", group.unit))
             if frozen:
-                self.paused[group.key] = record
+                confirmed = PausedGroup(
+                    record.group_key, record.unit, record.identities,
+                    "systemd", record.pause_token)
+                self.paused[group.key] = confirmed
+                if not self._sync_pause_journal():
+                    return ActionResult("pause", group.key, 0, len(identities),
+                                        detail="Unit freeze journal confirmation pending")
                 return ActionResult("pause", group.key, len(identities), 0, detail="Paused")
-            self._abandon_prepared_pause(record)
-            return ActionResult("pause", group.key, 0, 0, detail="Unit freeze unavailable")
+            # A timed-out/failed systemctl request is not proof that the freezer
+            # stayed running. Keep an uncertain marker unless a fresh probe
+            # proves no unit-wide transition occurred.
+            if self._unit_freezer_state(group.unit) == "running":
+                self._abandon_prepared_pause(record)
+                return ActionResult("pause", group.key, 0, 0,
+                                    detail="Unit freeze unavailable")
+            self.paused[group.key] = record
+            return ActionResult("pause", group.key, 0, len(identities),
+                                detail="Unit freeze recovery pending")
         changed = []
         for identity in identities:
-            if (not self._current(identity)
-                    or _is_stopped_state(_process_state(identity, self.source))
+            state = _process_state(identity, self.source)
+            if (not self._current(identity) or not state or _is_stopped_state(state)
                     or not self._signal(identity, signal.SIGSTOP)):
-                for paused_identity in changed:
-                    self._signal(paused_identity, signal.SIGCONT)
+                rollback_pending = tuple(
+                    paused_identity for paused_identity in changed
+                    if not self._signal(paused_identity, signal.SIGCONT)
+                )
+                if rollback_pending:
+                    retained = PausedGroup(
+                        record.group_key, record.unit, rollback_pending,
+                        record.backend, record.pause_token)
+                    self.paused[group.key] = retained
+                    self._untrack(tuple(
+                        tracked for tracked in record.identities
+                        if tracked not in rollback_pending
+                    ))
+                    journal_synced = self._sync_pause_journal()
+                    detail = "Pause rollback pending"
+                    if not journal_synced:
+                        detail += "; journal persistence pending"
+                    return ActionResult("pause", group.key, 0, len(rollback_pending),
+                                        detail=detail)
                 self._abandon_prepared_pause(record)
                 return ActionResult("pause", group.key, 0, 0,
                                     detail="Pause could not establish exact ownership")
@@ -1833,6 +1898,17 @@ class AppController:
         current = tuple(identity for identity in paused.identities if self._current(identity))
         changed = ()
         removed = tuple(identity for identity in paused.identities if identity not in current)
+        if paused.backend in ("systemd", "systemd-uncertain") and not current:
+            self._untrack(paused.identities)
+            self.paused.pop(group_key, None)
+            journal_synced = self._sync_pause_journal()
+            if self._deep_focus_tokens.get(group_key) == paused.pause_token:
+                self._deep_focus_tokens.pop(group_key, None)
+            return ActionResult(
+                "resume", group_key, 0, 0,
+                detail=("Stale unit pause discarded" if journal_synced
+                        else "Stale unit pause discarded; journal persistence pending"),
+            )
         if (paused.backend == "systemd" and len(current) == len(paused.identities)
                 and self._exclusive_paused_unit(paused)):
             thawed, _output = self._run(("systemctl", "--user", "thaw", paused.unit))
@@ -1847,10 +1923,16 @@ class AppController:
             # durable unit transition rather than waking a potentially reused unit.
             return ActionResult("resume", group_key, 0, len(paused.identities),
                                 detail="Unit thaw identity proof pending")
+        elif paused.backend == "systemd-uncertain":
+            return ActionResult("resume", group_key, 0, len(paused.identities),
+                                detail="Unit freeze ownership is uncertain")
         else:
             resumed = []
             for identity in current:
-                if not _is_stopped_state(_process_state(identity, self.source)):
+                state = _process_state(identity, self.source)
+                if not state:
+                    continue
+                elif not _is_stopped_state(state):
                     removed += (identity,)
                 elif self._signal(identity, signal.SIGCONT):
                     resumed.append(identity)
@@ -1870,6 +1952,9 @@ class AppController:
         if self._deep_focus_tokens.get(group_key) == paused.pause_token and not remaining:
             self._deep_focus_tokens.pop(group_key, None)
         detail = "Resumed" if changed else "No current identities were resumed"
+        if paused.backend == "process" and any(
+                not _process_state(identity, self.source) for identity in remaining):
+            detail = "Process state pending"
         if not journal_synced:
             detail = "%s; journal persistence pending" % detail
         return ActionResult("resume", group_key, len(changed), len(remaining),
@@ -1906,6 +1991,8 @@ class AppController:
             source=self.source,
             journal=self.journal,
             send_signal=self._signal,
+            groups_provider=self.groups_provider,
+            uid=self.uid,
         )
         current, _capability = self.journal.load()
         restored = {}
@@ -2021,7 +2108,7 @@ class GuardLease:
 
     def track(self, identity, backend="process", unit=""):
         """Register an exact pause identity before the controller mutates it."""
-        if backend not in ("process", "systemd") or not isinstance(unit, str):
+        if backend not in ("process", "systemd", "systemd-uncertain") or not isinstance(unit, str):
             return False
         return self._write(dict(
             {"op": "track", "backend": backend, "unit": unit},
