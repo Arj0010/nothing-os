@@ -110,6 +110,66 @@ class OptimizerSettings:
     manual_primary: str = ""
 
 
+@dataclass(frozen=True)
+class OptimizerSnapshot:
+    """A display-safe view of the optimizer state.
+
+    The GTK card receives only this immutable value.  Process discovery and all
+    policy decisions stay in the controller below, where they can be exercised
+    without a display server.
+    """
+
+    mode: Mode
+    profile: str
+    agent_sessions: int
+    groups: Tuple[AppGroup, ...]
+    capabilities: Tuple[Capability, ...]
+    network_label: str
+    meeting_active: bool
+    deep_focus: bool
+    manual_primary: str = ""
+
+
+def _agent_session_count(groups):
+    return sum(
+        group.key == "agent" or group.key.startswith("agent-")
+        or group.reason == "agent process tree"
+        for group in groups
+    )
+
+
+def _network_label(capabilities):
+    network = next((item for item in capabilities if item.name == "network"), None)
+    if network is None:
+        return "NETWORK · UNAVAILABLE"
+    detail = network.detail.strip().upper()
+    if detail.startswith("NETWORK · "):
+        return detail
+    if detail in ("BASIC", "FULL", "UNAVAILABLE"):
+        return "NETWORK · " + detail
+    return "NETWORK · " + ({
+        "full": "FULL", "fallback": "BASIC",
+    }.get(network.level, "UNAVAILABLE"))
+
+
+def build_snapshot(mode, groups, capabilities, deep_focus, meeting_active=False,
+                   manual_primary=""):
+    """Build an immutable, display-free projection of resolved optimizer state."""
+    groups = tuple(groups)
+    capabilities = tuple(capabilities)
+    return OptimizerSnapshot(
+        mode=Mode(mode),
+        profile="AGENT WORK",
+        agent_sessions=_agent_session_count(groups),
+        groups=groups,
+        capabilities=capabilities,
+        network_label=_network_label(capabilities),
+        meeting_active=bool(meeting_active),
+        deep_focus=bool(deep_focus),
+        manual_primary=manual_primary if isinstance(manual_primary, str) else "",
+    )
+
+
 DEFAULT_LOGIN_MODE = Mode.AUTO
 
 
@@ -2188,3 +2248,212 @@ class GuardLease:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+
+
+def command_runner(command):
+    """Run one fixed argument-vector command for an optimizer worker thread."""
+    try:
+        completed = subprocess.run(
+            tuple(command),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+        return completed.returncode == 0, completed.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+class OptimizerController:
+    """Own discovery, resource policy and recovery without a GTK dependency.
+
+    Callers run this controller from a worker thread, then render the returned
+    :class:`OptimizerSnapshot` on their UI thread.  The controller deliberately
+    exposes resolved groups rather than process names, so manual actions inherit
+    the same identity and role gates as automatic policy.
+    """
+
+    def __init__(self, runner=None, resource=None, applications=None,
+                 discovery=None, classifier=None, capture_probe=None,
+                 settings=None, settings_path=None, journal=None,
+                 uid=os.getuid(), clock=None, cooldown=30.0):
+        self.runner = runner or command_runner
+        self.uid = uid
+        self.clock = clock or time.monotonic
+        self.cooldown = max(0.0, float(cooldown))
+        self.discovery = discovery or (lambda: read_processes(uid=self.uid))
+        self.classifier = classifier or classify_groups
+        self.capture_probe = capture_probe or capture_state
+        self.settings_path = settings_path
+        self.settings = settings or (
+            load_settings(settings_path) if settings_path else OptimizerSettings()
+        )
+        self.mode = DEFAULT_LOGIN_MODE
+        self.deep_focus = False
+        self._groups = ()
+        self._capabilities = ()
+        self._last_desired = None
+        self._last_applied_at = None
+        self._recovered = False
+
+        shared_journal = journal or RuntimeJournal()
+        self.resource = resource or ResourceController(
+            self.runner, uid=self.uid, journal=shared_journal,
+        )
+        self.applications = applications or AppController(
+            self.runner,
+            uid=self.uid,
+            journal=shared_journal,
+            groups_provider=self.groups,
+        )
+
+    def groups(self):
+        """Return the most recently resolved immutable application groups."""
+        return self._groups
+
+    def _resolve(self):
+        try:
+            processes = tuple(self.discovery())
+        except Exception:
+            processes = ()
+        try:
+            capture = self.capture_probe(self.runner)
+        except Exception:
+            capture = CaptureState(active=False, brave=False, certain=False)
+        if not isinstance(capture, CaptureState):
+            capture = CaptureState(active=False, brave=False, certain=False)
+        try:
+            groups = self.classifier(
+                processes,
+                capture=capture,
+                manual_primary=self.settings.manual_primary,
+                uid=self.uid,
+            )
+        except Exception:
+            groups = ()
+        return promote_capture(tuple(groups), capture), capture
+
+    @staticmethod
+    def _desired_state(mode, groups, deep_focus):
+        return (
+            Mode(mode),
+            bool(deep_focus),
+            tuple(
+                (
+                    group.key,
+                    group.role,
+                    group.managed,
+                    tuple(process.identity for process in group.processes),
+                )
+                for group in groups
+            ),
+        )
+
+    def tick(self):
+        """Discover, safely recover once, apply changed policy, and snapshot."""
+        groups, capture = self._resolve()
+        self._groups = groups
+        if not self._recovered:
+            try:
+                self.applications.restore_interrupted()
+            except Exception:
+                pass
+            self._recovered = True
+
+        active_primary = any(group.role == Role.PRIMARY for group in groups)
+        desired = self._desired_state(self.mode, groups, self.deep_focus)
+        now = self.clock()
+        expired = (
+            self._last_applied_at is None
+            or now - self._last_applied_at >= self.cooldown
+        )
+        if desired != self._last_desired or expired:
+            try:
+                applied = self.resource.apply(self.mode, groups, active_primary)
+                self._capabilities = tuple(applied.capabilities)
+            except Exception:
+                self._capabilities = (
+                    Capability("cpu_io", "unavailable", "Resource policy unavailable"),
+                    Capability("memory", "unavailable", "Resource policy unavailable"),
+                    Capability("network", "unavailable", "Network policy unavailable"),
+                )
+            self._last_desired = desired
+            self._last_applied_at = now
+        return build_snapshot(
+            self.mode,
+            groups,
+            self._capabilities,
+            self.deep_focus and self.mode == Mode.FOCUS,
+            meeting_active=any(group.role == Role.MEETING for group in groups),
+            manual_primary=self.settings.manual_primary,
+        )
+
+    def set_mode(self, mode):
+        """Select a policy mode; leaving Focus safely releases Deep Focus."""
+        self.mode = Mode(mode)
+        if self.mode != Mode.FOCUS and self.deep_focus:
+            self.set_deep_focus(False)
+        self._last_desired = None
+        return self.mode
+
+    def set_manual_primary(self, group_key):
+        """Persist a stable primary override without deleting unavailable choices."""
+        group_key = group_key if isinstance(group_key, str) else ""
+        self.settings = OptimizerSettings(manual_primary=group_key)
+        self._last_desired = None
+        if not self.settings_path:
+            return True
+        return save_settings(self.settings_path, self.settings)
+
+    def set_deep_focus(self, enabled):
+        """Pause only eligible background groups, and only while Focus is selected."""
+        enabled = bool(enabled) and self.mode == Mode.FOCUS
+        try:
+            result = self.applications.set_deep_focus(self._groups, enabled)
+        except Exception:
+            result = ()
+        self.deep_focus = enabled
+        self._last_desired = None
+        return tuple(result)
+
+    def action(self, action, group_key, end_token=""):
+        """Run one safe manual action against a freshly resolved AppGroup."""
+        group = next((item for item in self._groups if item.key == group_key), None)
+        if group is None:
+            return ActionResult(action, group_key, 0, 0,
+                                detail="Resolved application group is unavailable")
+        if action == "pause":
+            return self.applications.pause(group, known_groups=self._groups)
+        if action == "resume":
+            return self.applications.resume(group.key)
+        if action == "end":
+            return self.applications.end(group)
+        if action == "force":
+            return self.applications.force(group, end_token)
+        return ActionResult(action, group_key, 0, 0, detail="Unknown application action")
+
+    def restore(self):
+        """Release only optimizer-owned resources and pauses before shutdown."""
+        result = []
+        try:
+            self.applications.set_deep_focus(self._groups, False)
+            result.extend(self.applications.restore_interrupted())
+        except Exception:
+            pass
+        try:
+            result.extend(self.resource.restore())
+        except Exception:
+            pass
+        self.deep_focus = False
+        return tuple(result)
+
+    def close(self):
+        """Close the crash guard after restore has been attempted."""
+        lease = getattr(self.applications, "lease", None)
+        try:
+            if lease is not None:
+                lease.close()
+        except Exception:
+            pass

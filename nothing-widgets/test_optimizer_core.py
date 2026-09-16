@@ -145,7 +145,20 @@ class FakeRunner:
         return value if isinstance(value, tuple) else (True, value)
 
 
-def sample_groups():
+def sample_groups(agent_sessions=None):
+    if agent_sessions is not None:
+        return tuple(
+            oc.AppGroup(
+                "agent-%d" % index,
+                "Claude session",
+                oc.Role.PRIMARY,
+                (proc(10 + index, 1, "claude", "/usr/bin/claude",
+                      "/app-agent-%d.scope" % index),),
+                unit="app-agent-%d.scope" % index,
+                reason="agent process tree",
+            )
+            for index in range(agent_sessions)
+        )
     return (
         oc.AppGroup("agent", "Claude", oc.Role.PRIMARY,
                     (proc(10, 1, "claude", "/usr/bin/claude", "/app-agent.scope"),),
@@ -154,6 +167,75 @@ def sample_groups():
                     (proc(20, 1, "postman", "/usr/bin/postman", "/app-postman.scope"),),
                     unit="app-postman.scope"),
     )
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_snapshot_reports_agent_sessions_and_basic_network(self):
+        snapshot = oc.build_snapshot(
+            mode=oc.Mode.AUTO,
+            groups=sample_groups(agent_sessions=4),
+            capabilities=(oc.Capability("network", "fallback", "BASIC"),),
+            deep_focus=False,
+        )
+        self.assertEqual(snapshot.profile, "AGENT WORK")
+        self.assertEqual(snapshot.agent_sessions, 4)
+        self.assertEqual(snapshot.network_label, "NETWORK · BASIC")
+        self.assertFalse(snapshot.deep_focus)
+
+
+class _FakeOptimizerResources:
+    def __init__(self):
+        self.applied = []
+
+    def apply(self, mode, groups, active_primary):
+        self.applied.append((mode, tuple(groups), active_primary))
+        return oc.AppliedState(
+            mode,
+            (),
+            (oc.Capability("network", "fallback", "BASIC"),),
+        )
+
+    def restore(self):
+        return ()
+
+
+class _FakeOptimizerApps:
+    def __init__(self):
+        self.recoveries = 0
+
+    def restore_interrupted(self):
+        self.recoveries += 1
+        return ()
+
+    def set_deep_focus(self, groups, enabled):
+        del groups, enabled
+        return ()
+
+
+class OptimizerControllerTest(unittest.TestCase):
+    def test_tick_applies_only_when_mode_or_resolved_state_changes(self):
+        resources = _FakeOptimizerResources()
+        apps = _FakeOptimizerApps()
+        controller = oc.OptimizerController(
+            runner=FakeRunner(),
+            resource=resources,
+            applications=apps,
+            discovery=lambda: (),
+            classifier=lambda processes, **kwargs: sample_groups(agent_sessions=1),
+            capture_probe=lambda runner: oc.CaptureState(False, False, True),
+            clock=FakeClock(),
+            cooldown=60,
+        )
+
+        first = controller.tick()
+        controller.tick()
+        controller.set_mode(oc.Mode.PERFORMANCE)
+        third = controller.tick()
+
+        self.assertEqual(first.agent_sessions, 1)
+        self.assertEqual(third.mode, oc.Mode.PERFORMANCE)
+        self.assertEqual(len(resources.applied), 2)
+        self.assertEqual(apps.recoveries, 1)
 
 
 def resource_runner(**kwargs):
@@ -1959,3 +2041,7 @@ class GuardIntegrationTest(unittest.TestCase):
         self.assertNotIn(("systemctl", "--user", "thaw", "app-test.scope"), runner.commands)
         entries, _capability = journal.load()
         self.assertEqual(len(entries["entries"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
