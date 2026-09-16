@@ -1705,7 +1705,7 @@ class RuntimeJournalTest(unittest.TestCase):
         entries, _capability = journal.load()
         self.assertEqual(entries["entries"][0]["backend"], "process-prepared")
 
-    def test_journal_restore_discards_all_stale_unit_pause_identities(self):
+    def test_journal_restore_retains_systemd_pause_without_live_identities(self):
         identity = oc.ProcessIdentity(326, 32600)
         journal = oc.MemoryJournal({
             "version": 1,
@@ -1719,15 +1719,17 @@ class RuntimeJournalTest(unittest.TestCase):
                 "owned": {"state": "frozen"},
             }],
         })
+        runner = FakeRunner()
         result = oc.restore_from_journal(
-            runner=FakeRunner(),
+            runner=runner,
             source=CurrentFakeProcessSource({326: 32601}),
             journal=journal,
             groups_provider=lambda: (),
         )
-        self.assertEqual(result[0].level, "full")
+        self.assertEqual(result[0].level, "unavailable")
+        self.assertNotIn(("systemctl", "--user", "thaw", "app-test.scope"), runner.commands)
         entries, _capability = journal.load()
-        self.assertEqual(entries["entries"], [])
+        self.assertEqual(len(entries["entries"]), 1)
 
     def test_thaw_reports_degradation_when_the_journal_cannot_clear(self):
         identity = oc.ProcessIdentity(324, 32400)
@@ -1779,7 +1781,7 @@ class GuardIntegrationTest(unittest.TestCase):
             child.kill()
             child.wait(timeout=3)
 
-    def test_guard_eof_never_resumes_a_prepared_disposable_sleep_process(self):
+    def test_guard_eof_never_resumes_a_bare_disposable_sleep_process(self):
         unique_name = "optimizer-guard-test-" + uuid.uuid4().hex
         child = subprocess.Popen([
             "bash", "-c", "exec -a %s sleep 30" % unique_name,
@@ -1808,7 +1810,6 @@ class GuardIntegrationTest(unittest.TestCase):
             self.addCleanup(self._cleanup_child, guard)
             guard.stdin.write(json.dumps({
                 "op": "track", "pid": child.pid, "start_time": start_time,
-                "backend": "process-prepared", "unit": "",
             }) + "\n")
             guard.stdin.flush()
             os.kill(child.pid, signal.SIGSTOP)

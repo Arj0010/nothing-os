@@ -1573,9 +1573,9 @@ def restore_from_journal(path=None, runner=None, source=None, journal=None,
                     if _current_user_identity(identity, source=source, uid=uid)
                 )
                 if not current:
-                    # The unit is no longer inhabited by an identity we paused.
-                    # It cannot be safely attributed or thawed, so relinquish it.
-                    changed = True
+                    # Zero live identities is still not ownership proof.  Keep
+                    # the record rather than losing an unresolved frozen unit.
+                    retained.append(entry)
                     continue
                 if (len(current) != len(identities)
                         or not _exclusive_managed_unit(

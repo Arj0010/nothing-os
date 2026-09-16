@@ -49,7 +49,9 @@ def main(stdin=None, groups_provider=None, restore_from_journal=None):
                 if set(message) not in ({"op", "pid", "start_time"},
                                         {"op", "pid", "start_time", "backend", "unit"}):
                     continue
-                backend = message.get("backend", "process")
+                # Legacy/bare track intent cannot prove the controller ever
+                # stopped the process, so treat it as non-resumable prepare.
+                backend = message.get("backend", "process-prepared")
                 unit = message.get("unit", "")
                 if backend not in (
                         "process", "process-prepared", "systemd", "systemd-uncertain") \
