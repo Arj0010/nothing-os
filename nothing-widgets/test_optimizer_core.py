@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the display-independent AGENT WORK optimizer core."""
 import inspect
+import io
 import json
 import os
 import signal
@@ -14,6 +15,7 @@ from dataclasses import replace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import optimizer_core as oc
+import optimizer_guard as og
 
 
 def proc(pid, ppid, comm, exe, cgroup, uid=1000, start=None, cmdline=()):
@@ -1307,6 +1309,38 @@ class AppControllerTest(unittest.TestCase):
             {"pid": first.identity.pid, "start_time": first.identity.start_time},
         ])
 
+    def test_successful_pause_rollback_removes_confirmed_ownership(self):
+        first = proc(9111, 1, "test-app", "/usr/bin/test-app", "", uid=1000)
+        second = proc(9112, 1, "test-app", "/usr/bin/test-app", "", uid=1000)
+        group = oc.AppGroup("rollback-clear", "Rollback clear", oc.Role.BACKGROUND,
+                            (first, second), unit="")
+        states = {first.identity.pid: "R", second.identity.pid: "R"}
+        source = CurrentFakeProcessSource({
+            first.identity.pid: first.identity.start_time,
+            second.identity.pid: second.identity.start_time,
+        }, states)
+
+        def send_signal(identity, signum):
+            if identity == first.identity and signum == signal.SIGSTOP:
+                states[identity.pid] = "T"
+                return True
+            if identity == second.identity and signum == signal.SIGSTOP:
+                return False
+            if identity == first.identity and signum == signal.SIGCONT:
+                states[identity.pid] = "R"
+                return True
+            return True
+
+        journal = oc.MemoryJournal()
+        controller = oc.AppController(
+            runner=FakeRunner(), uid=1000, source=source, journal=journal,
+            lease=FakeLease(), send_signal=send_signal,
+        )
+        self.assertEqual(controller.pause(group).changed, 0)
+        self.assertNotIn(group.key, controller.paused)
+        entries, _capability = journal.load()
+        self.assertEqual(entries["entries"], [])
+
     def test_uncertain_freeze_retains_the_prepared_recovery_record(self):
         group = group_with_role(oc.Role.BACKGROUND)
         freezer = ("systemctl", "--user", "show", group.unit, "--property=FreezerState")
@@ -1645,6 +1679,32 @@ class RuntimeJournalTest(unittest.TestCase):
         entries, _capability = journal.load()
         self.assertEqual(len(entries["entries"]), 1)
 
+    def test_journal_never_resumes_a_prepared_process_pause(self):
+        identity = oc.ProcessIdentity(327, 32700)
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause",
+                "group_key": "test",
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "",
+                "backend": "process-prepared",
+                "original": {"state": "running"},
+                "owned": {"state": "prepared"},
+            }],
+        })
+        signals = []
+        result = oc.restore_from_journal(
+            runner=FakeRunner(),
+            source=CurrentFakeProcessSource({327: 32700}, {327: "T"}),
+            journal=journal,
+            send_signal=lambda identity, signum: signals.append((identity, signum)) or True,
+        )
+        self.assertEqual(result[0].level, "unavailable")
+        self.assertEqual(signals, [])
+        entries, _capability = journal.load()
+        self.assertEqual(entries["entries"][0]["backend"], "process-prepared")
+
     def test_journal_restore_discards_all_stale_unit_pause_identities(self):
         identity = oc.ProcessIdentity(326, 32600)
         journal = oc.MemoryJournal({
@@ -1719,7 +1779,7 @@ class GuardIntegrationTest(unittest.TestCase):
             child.kill()
             child.wait(timeout=3)
 
-    def test_guard_eof_resumes_only_a_uniquely_named_disposable_sleep_process(self):
+    def test_guard_eof_never_resumes_a_prepared_disposable_sleep_process(self):
         unique_name = "optimizer-guard-test-" + uuid.uuid4().hex
         child = subprocess.Popen([
             "bash", "-c", "exec -a %s sleep 30" % unique_name,
@@ -1748,6 +1808,7 @@ class GuardIntegrationTest(unittest.TestCase):
             self.addCleanup(self._cleanup_child, guard)
             guard.stdin.write(json.dumps({
                 "op": "track", "pid": child.pid, "start_time": start_time,
+                "backend": "process-prepared", "unit": "",
             }) + "\n")
             guard.stdin.flush()
             os.kill(child.pid, signal.SIGSTOP)
@@ -1757,8 +1818,40 @@ class GuardIntegrationTest(unittest.TestCase):
             self.assertEqual(self._state(child.pid), "T")
             guard.stdin.close()
             guard.wait(timeout=3)
-            deadline = time.monotonic() + 2
-            while self._state(child.pid) == "T" and time.monotonic() < deadline:
+            self.assertEqual(self._state(child.pid), "T")
+
+    def test_guard_eof_resumes_a_confirmed_disposable_sleep_process(self):
+        unique_name = "optimizer-confirm-test-" + uuid.uuid4().hex
+        child = subprocess.Popen([
+            "bash", "-c", "exec -a %s sleep 30" % unique_name,
+        ])
+        self.addCleanup(self._cleanup_child, child)
+        with open("/proc/%d/stat" % child.pid, encoding="utf-8") as fh:
+            _ppid, start_time = oc._parse_stat(fh.read())
+        with tempfile.TemporaryDirectory() as config_home:
+            environment = os.environ.copy()
+            environment["XDG_CONFIG_HOME"] = config_home
+            guard = subprocess.Popen(
+                [sys.executable, os.path.join(os.path.dirname(__file__), "optimizer_guard.py")],
+                stdin=subprocess.PIPE, text=True, env=environment,
+            )
+            self.addCleanup(self._cleanup_child, guard)
+            for backend in ("process-prepared", "process"):
+                if backend == "process":
+                    os.kill(child.pid, signal.SIGSTOP)
+                    stopped_deadline = time.monotonic() + 2
+                    while self._state(child.pid) != "T" and time.monotonic() < stopped_deadline:
+                        time.sleep(0.02)
+                    self.assertEqual(self._state(child.pid), "T")
+                guard.stdin.write(json.dumps({
+                    "op": "track", "pid": child.pid, "start_time": start_time,
+                    "backend": backend, "unit": "",
+                }) + "\n")
+                guard.stdin.flush()
+            guard.stdin.close()
+            guard.wait(timeout=3)
+            resumed_deadline = time.monotonic() + 2
+            while self._state(child.pid) == "T" and time.monotonic() < resumed_deadline:
                 time.sleep(0.02)
             self.assertNotEqual(self._state(child.pid), "T")
 
@@ -1786,15 +1879,82 @@ class GuardIntegrationTest(unittest.TestCase):
             self.addCleanup(lease.close)
             self.assertTrue(lease.track(
                 oc.ProcessIdentity(child.pid, start_time),
-                backend="process", unit="app-test.scope",
+                backend="process-prepared", unit="app-test.scope",
             ))
             os.kill(child.pid, signal.SIGSTOP)
             stopped_deadline = time.monotonic() + 2
             while self._state(child.pid) != "T" and time.monotonic() < stopped_deadline:
                 time.sleep(0.02)
             self.assertEqual(self._state(child.pid), "T")
+            self.assertTrue(lease.track(
+                oc.ProcessIdentity(child.pid, start_time), backend="process", unit="",
+            ))
             lease.close()
             resumed_deadline = time.monotonic() + 2
             while self._state(child.pid) == "T" and time.monotonic() < resumed_deadline:
                 time.sleep(0.02)
             self.assertNotEqual(self._state(child.pid), "T")
+
+    def test_guard_restore_thaws_a_confirmed_exclusive_systemd_pause(self):
+        identity = oc.ProcessIdentity(328, 32800)
+        group = oc.AppGroup(
+            "test", "Test", oc.Role.BACKGROUND,
+            (proc(328, 1, "test-app", "/usr/bin/test-app", "/user/app-test.scope",
+                  start=32800),), unit="app-test.scope",
+        )
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause", "group_key": "test",
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "app-test.scope", "backend": "systemd",
+                "original": {"state": "running"}, "owned": {"state": "frozen"},
+            }],
+        })
+        runner = FakeRunner()
+
+        def restore(**kwargs):
+            return oc.restore_from_journal(
+                runner=runner,
+                source=CurrentFakeProcessSource({328: 32800}),
+                journal=journal,
+                **kwargs
+            )
+
+        og.main(io.StringIO(""), groups_provider=lambda: (group,),
+                restore_from_journal=restore)
+        self.assertEqual(runner.commands.count(
+            ("systemctl", "--user", "thaw", "app-test.scope")), 1)
+
+    def test_guard_restore_retains_systemd_pause_without_exclusive_proof(self):
+        identity = oc.ProcessIdentity(329, 32900)
+        group = oc.AppGroup(
+            "test", "Test", oc.Role.BACKGROUND,
+            (proc(329, 1, "test-app", "/usr/bin/test-app", "/user/app-test.scope",
+                  start=32900),), unit="app-test.scope",
+        )
+        sibling = replace(group_with_role(oc.Role.PRIMARY), unit="app-test.scope")
+        journal = oc.MemoryJournal({
+            "version": 1,
+            "entries": [{
+                "action": "pause", "group_key": "test",
+                "identities": [{"pid": identity.pid, "start_time": identity.start_time}],
+                "unit": "app-test.scope", "backend": "systemd",
+                "original": {"state": "running"}, "owned": {"state": "frozen"},
+            }],
+        })
+        runner = FakeRunner()
+
+        def restore(**kwargs):
+            return oc.restore_from_journal(
+                runner=runner,
+                source=CurrentFakeProcessSource({329: 32900}),
+                journal=journal,
+                **kwargs
+            )
+
+        og.main(io.StringIO(""), groups_provider=lambda: (group, sibling),
+                restore_from_journal=restore)
+        self.assertNotIn(("systemctl", "--user", "thaw", "app-test.scope"), runner.commands)
+        entries, _capability = journal.load()
+        self.assertEqual(len(entries["entries"]), 1)

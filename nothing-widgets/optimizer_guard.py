@@ -18,10 +18,19 @@ def _identity_from_message(message):
     return optimizer_core.ProcessIdentity(**value)
 
 
-def main(stdin=None):
+def _live_groups_provider():
+    """Return a fresh, current-user classification for unit recovery proof."""
+    uid = os.getuid()
+    return optimizer_core.classify_groups(
+        optimizer_core.read_processes(uid=uid), uid=uid)
+
+
+def main(stdin=None, groups_provider=None, restore_from_journal=None):
     """Read a lease stream and always restore exact tracked identities at its end."""
     tracked = {}
     stdin = sys.stdin if stdin is None else stdin
+    groups_provider = groups_provider or _live_groups_provider
+    restore_from_journal = restore_from_journal or optimizer_core.restore_from_journal
     try:
         for line in stdin:
             try:
@@ -42,7 +51,9 @@ def main(stdin=None):
                     continue
                 backend = message.get("backend", "process")
                 unit = message.get("unit", "")
-                if backend not in ("process", "systemd", "systemd-uncertain") or not isinstance(unit, str):
+                if backend not in (
+                        "process", "process-prepared", "systemd", "systemd-uncertain") \
+                        or not isinstance(unit, str):
                     continue
                 tracked[identity] = (backend, unit)
             elif operation == "untrack" and set(message) == {"op", "pid", "start_time"}:
@@ -57,7 +68,7 @@ def main(stdin=None):
                 os.kill(identity.pid, signal.SIGCONT)
             except OSError:
                 pass
-        optimizer_core.restore_from_journal()
+        restore_from_journal(groups_provider=groups_provider, uid=os.getuid())
     return 0
 
 

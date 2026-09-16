@@ -1174,7 +1174,8 @@ def _valid_runtime_entry(value):
     if not isinstance(value["original"], dict) or not isinstance(value["owned"], dict):
         return False
     if value["action"] == "pause":
-        if value["backend"] not in ("process", "systemd", "systemd-uncertain"):
+        if value["backend"] not in (
+                "process", "process-prepared", "systemd", "systemd-uncertain"):
             return False
         if value["backend"] in ("systemd", "systemd-uncertain"):
             return (
@@ -1184,6 +1185,11 @@ def _valid_runtime_entry(value):
                 and value["unit"].endswith((".scope", ".service"))
                 and value["original"] == {"state": "running"}
                 and value["owned"] == {"state": "frozen"}
+            )
+        if value["backend"] == "process-prepared":
+            return (
+                value["original"] == {"state": "running"}
+                and value["owned"] == {"state": "prepared"}
             )
         return (
             value["original"] == {"state": "running"}
@@ -1555,6 +1561,12 @@ def restore_from_journal(path=None, runner=None, source=None, journal=None,
                 # that this controller caused a frozen unit, so never thaw it.
                 retained.append(entry)
                 continue
+            if entry["backend"] == "process-prepared":
+                # Durable prepare intent proves no process transition.  A
+                # process could have been stopped by another actor after this
+                # marker, so recovery must never resume it.
+                retained.append(entry)
+                continue
             if entry["backend"] == "systemd":
                 current = tuple(
                     identity for identity in identities
@@ -1758,8 +1770,11 @@ class AppController:
                 "unit": paused.unit,
                 "backend": paused.backend,
                 "original": {"state": "running"},
-                "owned": {"state": "frozen" if paused.backend in (
-                    "systemd", "systemd-uncertain") else "stopped"},
+                "owned": {"state": (
+                    "frozen" if paused.backend in ("systemd", "systemd-uncertain")
+                    else "prepared" if paused.backend == "process-prepared"
+                    else "stopped"
+                )},
             })
         try:
             return self.journal.replace_action("pause", entries) is not False
@@ -1787,6 +1802,8 @@ class AppController:
                 pass
 
     def _record_pause(self, group, identities, backend):
+        if backend == "process":
+            backend = "process-prepared"
         return PausedGroup(
             group.key, group.unit, tuple(identities), backend,
             secrets.token_urlsafe(24),
@@ -1884,11 +1901,45 @@ class AppController:
                         detail += "; journal persistence pending"
                     return ActionResult("pause", group.key, 0, len(rollback_pending),
                                         detail=detail)
+                self.paused.pop(group.key, None)
                 self._abandon_prepared_pause(record)
                 return ActionResult("pause", group.key, 0, 0,
                                     detail="Pause could not establish exact ownership")
+            if (not self._current(identity)
+                    or not _is_stopped_state(_process_state(identity, self.source))):
+                # A successful signal return alone does not prove the stop was
+                # applied.  Leave the prepare marker non-restorable and undo
+                # only transitions already confirmed by this controller.
+                rollback_pending = tuple(
+                    paused_identity for paused_identity in changed
+                    if not self._signal(paused_identity, signal.SIGCONT)
+                )
+                if rollback_pending:
+                    self.paused[group.key] = PausedGroup(
+                        record.group_key, record.unit, rollback_pending,
+                        "process", record.pause_token)
+                    self._untrack(tuple(
+                        tracked for tracked in record.identities
+                        if tracked not in rollback_pending
+                    ))
+                    self._sync_pause_journal()
+                    return ActionResult("pause", group.key, 0, len(rollback_pending),
+                                        detail="Pause rollback pending")
+                self.paused.pop(group.key, None)
+                self._abandon_prepared_pause(record)
+                return ActionResult("pause", group.key, 0, 0,
+                                    detail="Pause stop confirmation unavailable")
             changed.append(identity)
-        self.paused[group.key] = record
+            confirmed = PausedGroup(
+                record.group_key, record.unit, tuple(changed), "process", record.pause_token)
+            self.paused[group.key] = confirmed
+            # Commit only verified stops before attempting another identity.  If
+            # persistence fails, a crash may leave this process stopped, but no
+            # recovery path will resume it without the durable confirmation.
+            if not self._sync_pause_journal():
+                return ActionResult("pause", group.key, 0, len(changed),
+                                    detail="Pause journal confirmation pending")
+            self._track((identity,), "process", record.unit)
         return ActionResult("pause", group.key, len(changed), 0, detail="Paused")
 
     def resume(self, group_key):
@@ -2106,9 +2157,10 @@ class GuardLease:
         except (BrokenPipeError, OSError):
             return False
 
-    def track(self, identity, backend="process", unit=""):
-        """Register an exact pause identity before the controller mutates it."""
-        if backend not in ("process", "systemd", "systemd-uncertain") or not isinstance(unit, str):
+    def track(self, identity, backend="process-prepared", unit=""):
+        """Register exact pause intent; use ``process`` only after confirmation."""
+        if backend not in (
+                "process", "process-prepared", "systemd", "systemd-uncertain") or not isinstance(unit, str):
             return False
         return self._write(dict(
             {"op": "track", "backend": backend, "unit": unit},
