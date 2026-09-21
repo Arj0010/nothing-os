@@ -96,32 +96,33 @@ Autostart (`nothing-conky.desktop`, installed in step 2) relaunches everything
 ~6s after each login. Optional keybindings (Alt+Space, Ctrl+Esc, …) are set
 through **Cinnamon ▸ Keyboard ▸ Shortcuts** — see the table above.
 
-## CLEAN :// widget
+## OPTIMISE :// widget
 
-Opens from the rail (`◌`). Sizes every cache it knows about, and `CLEAN NOW`
-empties the safe ones in one tap. The rail icon shows the reclaimable total, so
-you can tell there's something to clean without opening the card.
+The rail card is now an `AGENT WORK` optimizer for Claude/Codex terminal-heavy
+engineering. It discovers every Claude/Codex tree (including Python, Node, Java,
+test-runner, and compiler descendants) as Primary. Brave and VS Code stay
+Interactive; Spotify, VLC, and Telegram keep a media/comms lane.
 
-- **Held targets** (`~/.cache/puppeteer`, `~/.cache/uv`) are sized and shown but
-  never auto-cleaned — deleting them costs a ~600 MB re-download or slow rebuilds.
-  Each has its own `×`.
-- **Every deletion is path-guarded** to `~/.cache` and `~/.local/share/Trash`;
-  contents go, the directory stays, and symlinks pointing outside are unlinked
-  rather than followed. The logic lives in `nothing-widgets/cleaner_core.py` with
-  tests in `test_cleaner_core.py` (`python3 nothing-widgets/test_cleaner_core.py`).
-- **Apps come back.** `~/.cache/vicinae` is cleared with `vicinae.service` stopped
-  around it; anything else watched (conky) that dies during a clean is relaunched,
-  and the card reports `RESTARTED …`.
-- **The memory timeline** samples top processes every 30 s to a 7-day rolling log,
-  showing per-app peak RSS. `KILL` sends `SIGTERM` only and asks `SURE?` first.
-- **`PERF` switch** toggles the power profile. It drives `powerprofilesctl`, not
-  `scaling_governor` — `power-profiles-daemon` owns CPU policy here and reverts
-  hand-written sysfs values. Needs no root (PPD exposes it over polkit), and it is
-  a plain toggle with no `SURE?` because it is instantly reversible. Measured
-  2701 → 3765 MHz. The row says `ON BATTERY` when unplugged, since PPD keeps a
-  lower ceiling regardless of the profile selected.
-- **No `drop_caches`.** It would discard useful page cache and make the machine
-  slower, not faster.
+- **Modes:** Auto is the login default; Perf, Battery, and Focus temporarily tune
+  relative CPU, I/O, soft memory-pressure, and power-profile policy. They never
+  terminate applications. `EDIT PRIORITY` temporarily makes one resolved app the
+  Primary lane; `AUTO · CLAUDE + CODEX` restores the built-in profile.
+- **Meeting Guard:** Brave is promoted to Meeting when capture is attributed to it,
+  or whenever active capture attribution is uncertain. It is never automatically
+  paused, throttled, ended, or forced.
+- **Deep Focus:** available only in Focus. It reversibly pauses eligible Background
+  groups and a crash guard restores only identities this controller confirmed it
+  paused. Primary, Meeting, Protected, and active media/comms lanes are not targets.
+- **App Control:** groups are identified by current `(pid, start_time)` identities,
+  never a short process name. Pause/Resume is reversible. End is manual and asks
+  for confirmation; Force appears only after that exact graceful End leaves live
+  survivors and asks again. Protected, Primary, and Meeting rows are status-only.
+- **Network:** `NETWORK · BASIC` means the core is running safely without per-app
+  traffic shaping. Full egress prioritization needs the separate, opt-in privileged
+  helper; the UI will not claim it until the helper proves its owned rules are live.
+- **Cleaner is separate:** `OPEN CLEANER` contains storage reclamation only. Held
+  targets remain protected, all deletion paths are guarded, and no cleaner action
+  kills a process.
 
 The two root-owned targets (apt cache, journal) need a pinned sudoers rule:
 

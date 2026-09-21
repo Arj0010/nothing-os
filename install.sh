@@ -7,6 +7,8 @@ mkdir -p ~/.config/nothing-widgets ~/.config/conky/nothing ~/.config/autostart ~
 
 cp "$R/nothing-widgets/nothing-widgets.py" ~/.config/nothing-widgets/
 cp "$R/nothing-widgets/cleaner_core.py" ~/.config/nothing-widgets/
+cp "$R/nothing-widgets/optimizer_core.py" ~/.config/nothing-widgets/
+cp "$R/nothing-widgets/optimizer_guard.py" ~/.config/nothing-widgets/
 cp "$R/conky/"* ~/.config/conky/nothing/ 2>/dev/null || true
 cp "$R/nothing-conky.desktop" ~/.config/autostart/
 install -m 755 "$R/bin/shot" ~/.local/bin/shot

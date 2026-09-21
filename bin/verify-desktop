@@ -72,6 +72,8 @@ echo "desktop files (live vs repo)"
 for pair in \
   "$HOME/.config/nothing-widgets/nothing-widgets.py:$R/nothing-widgets/nothing-widgets.py" \
   "$HOME/.config/nothing-widgets/cleaner_core.py:$R/nothing-widgets/cleaner_core.py" \
+  "$HOME/.config/nothing-widgets/optimizer_core.py:$R/nothing-widgets/optimizer_core.py" \
+  "$HOME/.config/nothing-widgets/optimizer_guard.py:$R/nothing-widgets/optimizer_guard.py" \
   "$HOME/.config/conky/nothing/bg.conf:$R/conky/bg.conf" \
   "$HOME/.config/autostart/nothing-conky.desktop:$R/nothing-conky.desktop" \
   "$HOME/.local/bin/shot:$R/bin/shot"; do
