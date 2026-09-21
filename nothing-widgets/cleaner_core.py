@@ -398,7 +398,10 @@ def sample(top_n=SAMPLE_TOP_N):
     agg = {}
     me = os.getpid()
     for pid, comm, _cmd, rss in _iter_procs():
-        if pid == me:
+        # Zombies and other nonresident tasks can remain visible briefly after a
+        # detached helper exits. They have no usable memory sample and must not
+        # create a zero-RSS application row.
+        if pid == me or rss <= 0:
             continue
         cur = agg.get(comm)
         if cur is None:

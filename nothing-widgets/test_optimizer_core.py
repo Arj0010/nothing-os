@@ -183,6 +183,20 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot.network_label, "NETWORK · BASIC")
         self.assertFalse(snapshot.deep_focus)
 
+    def test_dry_run_emits_safe_json_snapshot(self):
+        import subprocess
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "optimizer_core.py")
+        completed = subprocess.run(
+            (sys.executable, script, "--dry-run"),
+            check=True, capture_output=True, text=True,
+        )
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["mode"], "auto")
+        self.assertIn("roles", payload)
+        self.assertIn("capabilities", payload)
+        self.assertFalse(any(" " in key for key in payload["roles"]))
+
 
 class AppControlPresentationTest(unittest.TestCase):
     def test_busy_action_stays_disabled_when_a_snapshot_recreates_group_rows(self):
@@ -2106,6 +2120,60 @@ class RuntimeJournalTest(unittest.TestCase):
         self.assertEqual(result[0].level, "unavailable")
         entries, _capability = journal.load()
         self.assertEqual(len(entries["entries"]), 1)
+
+
+class DisposableActionIntegrationTest(unittest.TestCase):
+    """Exercise manual actions only against a child this test created."""
+
+    def _cleanup_child(self, child):
+        if child.poll() is None:
+            try:
+                os.kill(child.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            child.kill()
+        child.wait(timeout=3)
+
+    def _identity(self, child):
+        with open("/proc/%d/stat" % child.pid, encoding="utf-8") as fh:
+            _ppid, start_time = oc._parse_stat(fh.read())
+        return oc.ProcessIdentity(child.pid, start_time)
+
+    def test_pause_resume_graceful_end_and_gated_force_use_only_disposable_child(self):
+        unique_name = "optimizer-action-test-" + uuid.uuid4().hex
+        child = subprocess.Popen([
+            "bash", "-c",
+            "trap '' TERM; exec -a %s bash -c 'trap \"\" TERM; while :; do sleep 1; done'" % unique_name,
+        ])
+        self.addCleanup(self._cleanup_child, child)
+        command_line = b""
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with open("/proc/%d/cmdline" % child.pid, "rb") as fh:
+                command_line = fh.read()
+            if unique_name.encode("ascii") in command_line:
+                break
+            time.sleep(0.02)
+        self.assertIn(unique_name.encode("ascii"), command_line)
+        identity = self._identity(child)
+        group = oc.AppGroup(
+            "disposable-action", "Disposable action", oc.Role.BACKGROUND,
+            (oc.ProcessInfo(identity, 1, os.getuid(), "bash", "/usr/bin/bash", ""),),
+            unit="",
+        )
+        clock = FakeClock()
+        controller = oc.AppController(
+            runner=FakeRunner(), uid=os.getuid(), journal=oc.MemoryJournal(),
+            lease=FakeLease(), clock=clock, sleeper=clock.sleep,
+        )
+        self.assertEqual(controller.force(group, "unissued").changed, 0)
+        self.assertEqual(controller.pause(group).changed, 1)
+        self.assertEqual(controller.resume(group.key).changed, 1)
+        ended = controller.end(group)
+        self.assertGreater(ended.survived, 0)
+        self.assertTrue(ended.end_token)
+        self.assertEqual(controller.force(group, ended.end_token).changed, 1)
+        child.wait(timeout=3)
 
 
 class GuardIntegrationTest(unittest.TestCase):

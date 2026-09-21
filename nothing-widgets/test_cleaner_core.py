@@ -173,6 +173,15 @@ class HistoryTest(unittest.TestCase):
 
 
 class ProcTest(unittest.TestCase):
+    def test_sample_ignores_zero_rss_processes(self):
+        with mock.patch.object(cc, "_iter_procs", return_value=iter((
+                (101, "zombie", "", 0),
+                (102, "worker", "", 4096),
+        ))):
+            self.assertEqual(cc.sample(top_n=5), [
+                {"name": "worker", "rss": 4096, "pid": 102, "top": 4096},
+            ])
+
     def test_sample_returns_plausible_rows(self):
         rows = cc.sample(top_n=5)
         self.assertTrue(rows, "should see at least one process")
@@ -260,6 +269,10 @@ class AliveTest(unittest.TestCase):
             finally:
                 cc.WATCHED = saved
                 __import__("subprocess").run(["pkill", "-x", name])
+                deadline = time.monotonic() + 1.0
+                while cc._alive(name) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                cc._reap_detached()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

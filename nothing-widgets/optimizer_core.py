@@ -2554,3 +2554,49 @@ class OptimizerController:
                     lease.close()
             except Exception:
                 pass
+
+
+class _DryRunRunner:
+    """Permit only metadata probes used by the JSON dry-run entry point."""
+
+    _PROBES = frozenset((
+        ("pactl", "-f", "json", "list", "source-outputs"),
+        ("pw-dump",),
+        ("nothing-optimizer-helper", "--capabilities"),
+        ("powerprofilesctl", "get"),
+    ))
+
+    def run(self, command, input_text=""):
+        del input_text
+        if tuple(command) not in self._PROBES:
+            raise RuntimeError("dry-run forbids mutation")
+        return command_runner(command)
+
+
+def dry_run_payload():
+    """Return discovery state without applying policy or exposing command lines."""
+    runner = _DryRunRunner()
+    processes = read_processes(uid=os.getuid())
+    state = capture_state(runner)
+    groups = promote_capture(
+        classify_groups(processes, capture=state, uid=os.getuid()), state,
+    )
+    capabilities = detect_capabilities(runner) + (
+        Capability("cpu_io", "unavailable", "Dry run does not apply CPU or I/O policy"),
+        Capability("memory", "unavailable", "Dry run does not apply memory policy"),
+    )
+    roles = {role.value: 0 for role in Role}
+    for group in groups:
+        roles[group.role.value] += len(group.processes)
+    return {
+        "mode": DEFAULT_LOGIN_MODE.value,
+        "roles": roles,
+        "capabilities": {capability.name: capability.level for capability in capabilities},
+    }
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--dry-run"]:
+        print(json.dumps(dry_run_payload(), sort_keys=True))
+    else:
+        raise SystemExit("usage: optimizer_core.py --dry-run")
