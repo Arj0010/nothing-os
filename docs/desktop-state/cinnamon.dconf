@@ -1,0 +1,139 @@
+[/]
+desklet-snap-interval=25
+enabled-applets=['panel1:left:0:menu@cinnamon.org:0', 'panel1:left:2:grouped-window-list@cinnamon.org:2', 'panel1:right:1:systray@cinnamon.org:3', 'panel1:right:2:xapp-status@cinnamon.org:4', 'panel1:right:3:notifications@cinnamon.org:5', 'panel1:right:8:network@cinnamon.org:10', 'panel1:right:9:sound@cinnamon.org:11', 'panel1:right:10:power@cinnamon.org:12', 'panel1:right:11:calendar@cinnamon.org:13', 'panel1:right:12:cornerbar@cinnamon.org:14']
+enabled-desklets=@as []
+hotcorner-layout=['expo:false:0', 'scale:false:0', 'scale:false:0', 'desktop:false:0']
+next-applet-id=16
+next-desklet-id=5
+panel-zone-icon-sizes='[{"panelId": 1, "left": 0, "center": 0, "right": 20}]'
+panel-zone-symbolic-icon-sizes='[{"panelId": 1, "left": 22, "center": 22, "right": 14}]'
+panels-autohide=['1:true']
+panels-height=['1:32']
+window-effect-speed=1
+
+[desktop/a11y/keyboard]
+bouncekeys-delay=300
+mousekeys-accel-time=300
+mousekeys-init-delay=300
+mousekeys-max-speed=10
+slowkeys-delay=300
+
+[desktop/a11y/magnifier]
+mag-factor=1.1679804816116286
+
+[desktop/a11y/mouse]
+dwell-threshold=10
+dwell-time=1.2
+secondary-click-time=1.2
+
+[desktop/background]
+picture-options='stretched'
+picture-uri='file:///home/arjun/.config/conky/nothing/wallpaper-1784914615.png'
+primary-color='#000000'
+
+[desktop/background/slideshow]
+delay=5
+image-source='xml:///usr/share/cinnamon-background-properties/linuxmint-wallpapers.xml'
+random-order=true
+slideshow-enabled=false
+
+[desktop/interface]
+cursor-blink-time=1200
+cursor-size=19
+gtk-theme='Mint-L-Dark-Red'
+icon-theme='Papirus-Dark'
+
+[desktop/keybindings]
+custom-list=['custom0', 'custom1', 'custom2', 'custom3']
+
+[desktop/keybindings/custom-keybindings/custom0]
+command=''
+name=''
+
+[desktop/keybindings/custom-keybindings/custom1]
+binding=['<Super><Shift>v']
+command='/usr/local/bin/vicinae deeplink vicinae://launch/clipboard/history'
+name='Vicinae Clipboard'
+
+[desktop/keybindings/custom-keybindings/custom2]
+binding=['<Primary><Shift>s']
+command='gnome-screenshot -a'
+name='Take a screenshot of area'
+
+[desktop/keybindings/custom-keybindings/custom3]
+binding=['<Alt>space']
+command='/usr/local/bin/vicinae toggle'
+name='Vicinae Toggle'
+
+[desktop/keybindings/media-keys]
+area-screenshot=['<Shift>Print']
+
+[desktop/keybindings/wm]
+activate-window-menu=@as []
+close=['<Alt>F4', '<Control>Escape']
+maximize=['<Super>Up']
+toggle-fullscreen=['<Super>f']
+
+[desktop/notifications]
+display-notifications=true
+notification-duration=4
+
+[desktop/peripherals/keyboard]
+delay=uint32 500
+numlock-state=true
+repeat-interval=uint32 30
+
+[desktop/peripherals/mouse]
+double-click=400
+drag-threshold=8
+speed=1.0
+
+[desktop/peripherals/touchpad]
+speed=0.29831932773109249
+
+[desktop/screensaver]
+lock-enabled=false
+
+[desktop/sound]
+event-sounds=false
+
+[desktop/wm/preferences]
+theme='Mint-L-Dark-Red'
+
+[gestures]
+enabled=true
+pinch-in-2=''
+pinch-out-2=''
+pinch-percent-threshold=uint32 40
+swipe-down-2='PUSH_TILE_DOWN::::start'
+swipe-down-3='VOLUME_DOWN::::start'
+swipe-down-4='TOGGLE_OVERVIEW::::start'
+swipe-left-2='PUSH_TILE_LEFT::::start'
+swipe-left-3='WORKSPACE_PREVIOUS::::start'
+swipe-left-4='WINDOW_WORKSPACE_PREVIOUS::::start'
+swipe-left-5=''
+swipe-percent-threshold=uint32 60
+swipe-right-2='PUSH_TILE_RIGHT::::start'
+swipe-right-3='WORKSPACE_NEXT::::start'
+swipe-right-4='WINDOW_WORKSPACE_NEXT::::start'
+swipe-up-2='PUSH_TILE_UP::::start'
+swipe-up-3='VOLUME_UP::::start'
+swipe-up-4='TOGGLE_EXPO::::start'
+tap-3='MEDIA_PLAY_PAUSE::::start'
+tap-4='TOGGLE_DESKTOP::::start'
+
+[muffin]
+workspace-cycle=true
+
+[settings-daemon/peripherals/keyboard]
+numlock-state='on'
+
+[settings-daemon/plugins/color]
+night-light-last-coordinates=(22.32, 88.219999999999999)
+
+[settings-daemon/plugins/power]
+lid-close-ac-action='nothing'
+lid-close-battery-action='nothing'
+
+[theme]
+name='Mint-L-Dark-Red'

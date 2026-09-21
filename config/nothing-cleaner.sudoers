@@ -1,0 +1,18 @@
+# Nothing OS — CLEAN :// widget
+#
+# Lets the widget reclaim the two big root-owned caches without a password
+# prompt. A widget window cannot take keyboard focus, so an interactive prompt
+# would simply hang.
+#
+# The grant is pinned to these two exact commands with no arguments of the
+# caller's choosing: apt-get clean takes none, and the vacuum size is fixed
+# here rather than passed in. Neither can be steered into doing anything else.
+#
+# Installed by:  ./install.sh --with-cleaner-sudo
+# Removed by:    sudo rm /etc/sudoers.d/nothing-cleaner
+#
+# Replace "arjun" with your username if you are not on the machine this was
+# written for. Must be mode 0440, owned by root.
+
+arjun ALL=(root) NOPASSWD: /usr/bin/apt-get clean
+arjun ALL=(root) NOPASSWD: /usr/bin/journalctl --vacuum-size=100M

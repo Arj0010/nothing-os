@@ -126,7 +126,7 @@ POPOUT_W = 460          # every rail pop-out shares this width
 NOTES_W  = 560          # Notes gets extra room to actually read/write
 PANE_ORDER = ["clock", "system", "status", "net", "now", "sessions"]
 # Everything else is reachable from the RAIL: a slim icon strip on the left edge.
-RAIL_ORDER = ["controls", "pomo", "calendar", "notes", "arcade"]
+RAIL_ORDER = ["controls", "pomo", "calendar", "notes", "arcade", "palette"]
 PANE = {}          # wname -> Widget, filled as they are constructed
 
 def relayout_pane():
@@ -527,6 +527,11 @@ def vbox(spacing=6, m=0):
     b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
     b.get_style_context().add_class("card")
     return b
+
+def vbox_plain(spacing=6):
+    # unstyled column for grouping rows INSIDE a card — a nested .card would draw a
+    # second border and background over the first
+    return Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
 
 # ---------- CLOCK ----------
 class Clock(Widget):
@@ -1563,6 +1568,672 @@ class Palette(Widget):
             ctx = btn.get_style_context()
             (ctx.add_class if n == THEME_NAME else ctx.remove_class)("on")
 
+# ---------- OPTIMISE :// (agent work + storage-only cleaner) ----------
+try:
+    import cleaner_core
+except Exception:      # the card degrades to a notice rather than killing the desktop
+    cleaner_core = None
+
+try:
+    import optimizer_core
+except Exception:      # keep the desktop usable when the optional optimizer is absent
+    optimizer_core = None
+
+MSPARK = "·▁▂▃▄▅▆▇█"
+def msparkline(vals, hi=0):
+    """Sparkline where an empty bucket is a dot, not a bar.
+
+    spark()'s glyph for zero is ▁, which draws a solid baseline across every
+    bucket with no sample in it — on a week-long axis that is most of the width,
+    and the result reads as a filled progress bar rather than sparse history.
+    """
+    vals = list(vals)
+    if not vals: return ""
+    top = hi or (max(vals) or 1)
+    out = []
+    for v in vals:
+        try: v = float(v)
+        except Exception: v = 0.0
+        if v <= 0:
+            out.append(MSPARK[0]); continue
+        v = min(top, v)
+        out.append(MSPARK[1 + int(v / top * (len(MSPARK) - 2))])
+    return "".join(out)
+
+def hsize(n):
+    """human() with one decimal at GB. '1.5G' vs '1G' is the difference between
+    bothering to clean and not."""
+    n = float(max(0, n))
+    if n < 1024: return "%dB" % n
+    n /= 1024
+    if n < 1024: return "%.0fK" % n
+    n /= 1024
+    if n < 1024: return "%.0fM" % n
+    return "%.1fG" % (n / 1024)
+
+class Optimizer(Widget):
+    """OPTIMISE :// — immutable AGENT WORK views plus storage-only cleaner."""
+    SHOWN     = 6        # target rows before the remainder collapses into OTHER
+    RESCAN_MS = 60000
+    SAMPLE_MS = 30000
+
+    def __init__(self):
+        super().__init__("clean", 1440, 270, 430)
+        self.scan_rows = []
+        self.reclaim = 0
+        self.busy = False
+        self._destroyed = False
+        self._tick_busy = False
+        self._snapshot = None
+        self._force_tokens = {}
+        self._app_action_busy = set()
+        self._app_status_text = ""
+        self._focus_rendering = False
+        self._restore_thread = None
+        self.controller = None
+
+        b = vbox(7, m=22)
+        self.tag = L("", "dim")
+        b.pack_start(self.header("OPTIMISE ://", collapsible=True, subtitle=self.tag),
+                     False, False, 0)
+        body = vbox_plain(7)
+        b.pack_start(body, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_transition_duration(160)
+        self.stack.add_titled(self._build_main(), "main", "OPTIMISE")
+        self.stack.add_titled(self._build_cleaner(), "cleaner", "CLEANER")
+        self.stack.add_titled(self._build_apps(), "apps", "APP CONTROL")
+        body.pack_start(self.stack, False, False, 0)
+
+        self.add(b)
+        self.setup_collapse(body)
+        if optimizer_core is not None:
+            try:
+                self.controller = optimizer_core.OptimizerController(
+                    settings_path=os.path.join(CONF_DIR, "optimizer-settings.json"),
+                )
+            except Exception:
+                self.controller = None
+        if self.controller is None:
+            self.main_status.set_text("optimizer_core.py MISSING")
+        else:
+            self.first(self._tick_async)
+            GLib.timeout_add(3000, self._tick_async)
+        if cleaner_core is None:
+            self.status.set_text("cleaner_core.py MISSING")
+        else:
+            self.first(self._scan_async)
+            GLib.timeout_add(self.RESCAN_MS, self._scan_async)
+        self.connect("destroy", self._on_destroy)
+
+    def _tile(self, label):
+        button = Gtk.Button(label=label)
+        button.get_style_context().add_class("tile")
+        button.set_relief(Gtk.ReliefStyle.NONE)
+        return button
+
+    def _text_row(self, name, value="—"):
+        row = Gtk.Box(spacing=8)
+        key = L(name, "k"); key.set_xalign(0)
+        val = L(value, "dim"); val.set_xalign(1); val.set_hexpand(True)
+        row.pack_start(key, True, True, 0)
+        row.pack_end(val, False, False, 0)
+        return row, val
+
+    def _build_main(self):
+        page = vbox_plain(6)
+        modes = Gtk.Box(spacing=4)
+        self.mode_buttons = {}
+        for label, mode in (("AUTO", "AUTO"), ("PERF", "PERFORMANCE"),
+                            ("BATTERY", "BATTERY"), ("FOCUS", "FOCUS")):
+            button = self._tile(label)
+            button.set_hexpand(True)
+            button.connect("clicked", self._set_mode, mode)
+            modes.pack_start(button, True, True, 0)
+            self.mode_buttons[mode] = button
+        page.pack_start(modes, False, False, 0)
+
+        page.pack_start(rule(), False, False, 0)
+        profile = Gtk.Box(spacing=8)
+        self.profile_value = L("AGENT WORK", "k"); self.profile_value.set_hexpand(True)
+        self.priority_button = self._tile("EDIT PRIORITY")
+        self.priority_button.connect("clicked", self._open_priority)
+        profile.pack_start(self.profile_value, True, True, 0)
+        profile.pack_end(self.priority_button, False, False, 0)
+        page.pack_start(profile, False, False, 0)
+        self.priority_note = L("AUTO · CLAUDE + CODEX", "faint")
+        page.pack_start(self.priority_note, False, False, 0)
+
+        page.pack_start(rule(), False, False, 0)
+        row, self.primary_value = self._text_row("CLAUDE + CODEX TERMINALS", "—")
+        page.pack_start(row, False, False, 0)
+        self.lane_values = {}
+        for key, label in (("brave", "BRAVE"), ("code", "VS CODE"),
+                           ("media", "SPOTIFY / VLC / TELEGRAM")):
+            row, value = self._text_row(label, "IDLE")
+            self.lane_values[key] = value
+            page.pack_start(row, False, False, 0)
+
+        page.pack_start(rule(), False, False, 0)
+        self.capability_values = {}
+        for key, label in (("power", "CPU"), ("network", "NETWORK"),
+                           ("cpu_io", "DISK I/O"), ("memory", "MEMORY")):
+            row, value = self._text_row(label, "UNAVAILABLE")
+            self.capability_values[key] = value
+            page.pack_start(row, False, False, 0)
+
+        page.pack_start(rule(), False, False, 0)
+        row, self.meeting_value = self._text_row("MEETING GUARD", "IDLE")
+        page.pack_start(row, False, False, 0)
+        focus = Gtk.Box(spacing=8)
+        focus.pack_start(L("DEEP FOCUS", "k"), True, True, 0)
+        self.focus_switch = Gtk.Switch()
+        self.focus_switch.set_sensitive(False)
+        self.focus_switch.connect("notify::active", self._set_deep_focus)
+        focus.pack_end(self.focus_switch, False, False, 0)
+        page.pack_start(focus, False, False, 0)
+        self.main_status = L("CONNECTING", "faint")
+        page.pack_start(self.main_status, False, False, 0)
+
+        nav = Gtk.Box(spacing=6)
+        cleaner = self._tile("OPEN CLEANER")
+        cleaner.connect("clicked", lambda *_: self._show_view("cleaner"))
+        apps = self._tile("APP CONTROL")
+        apps.connect("clicked", lambda *_: self._show_view("apps"))
+        nav.pack_start(cleaner, True, True, 0)
+        nav.pack_start(apps, True, True, 0)
+        page.pack_start(nav, False, False, 0)
+        return page
+
+    def _build_cleaner(self):
+        page = vbox_plain(7)
+        top = Gtk.Box(spacing=8)
+        top.pack_start(L("CLEANER ://", "title"), True, True, 0)
+        back = self._tile("BACK")
+        back.connect("clicked", lambda *_: self._show_view("main"))
+        top.pack_end(back, False, False, 0)
+        page.pack_start(top, False, False, 0)
+        self.total = L("—", "clock2"); self.total.set_xalign(0)
+        page.pack_start(self.total, False, False, 0)
+        page.pack_start(L("RECLAIMABLE STORAGE", "faint"), False, False, 0)
+        self.btn = self._tile("CLEAN NOW")
+        self.btn.set_size_request(-1, 38)
+        self.btn.connect("clicked", self._clean_now)
+        page.pack_start(self.btn, False, False, 0)
+        self.status = L("SCANNING", "faint")
+        page.pack_start(self.status, False, False, 0)
+        page.pack_start(rule(), False, False, 0)
+        self.tbox = vbox_plain(3); page.pack_start(self.tbox, False, False, 0)
+        self.heldlbl = L("HELD · not auto-cleaned", "faint")
+        page.pack_start(rule(), False, False, 0)
+        page.pack_start(self.heldlbl, False, False, 0)
+        self.hbox = vbox_plain(3); page.pack_start(self.hbox, False, False, 0)
+        page.pack_start(rule(), False, False, 0)
+        page.pack_start(L("STORAGE ONLY · no processes killed", "faint"), False, False, 0)
+        return page
+
+    def _build_apps(self):
+        page = vbox_plain(7)
+        top = Gtk.Box(spacing=8)
+        top.pack_start(L("APP CONTROL ://", "title"), True, True, 0)
+        back = self._tile("BACK")
+        back.connect("clicked", lambda *_: self._show_view("main"))
+        top.pack_end(back, False, False, 0)
+        page.pack_start(top, False, False, 0)
+        self.app_status = L("RESOLVING APP GROUPS", "faint")
+        page.pack_start(self.app_status, False, False, 0)
+        page.pack_start(rule(), False, False, 0)
+        self.app_box = vbox_plain(5)
+        page.pack_start(self.app_box, False, False, 0)
+        return page
+
+    def _show_view(self, name):
+        self.stack.set_visible_child_name(name)
+        if name == "cleaner":
+            self._scan_async()
+        if name == "apps":
+            self._render_apps()
+
+    # ---- immutable optimizer snapshot delivery ---------------------------
+    def _tick_async(self, *_):
+        if self._destroyed:
+            return False
+        if self.controller is None or self._tick_busy:
+            return True
+        self._tick_busy = True
+        def work():
+            try:
+                snapshot = self.controller.tick()
+                error = ""
+            except Exception as exc:
+                snapshot = None
+                error = "Optimizer unavailable: %s" % type(exc).__name__
+            GLib.idle_add(self._tick_done, snapshot, error)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _tick_done(self, snapshot, error):
+        self._tick_busy = False
+        if self._destroyed:
+            return False
+        if snapshot is not None:
+            self._snapshot = snapshot
+            self._render_snapshot(snapshot)
+        elif error:
+            self.main_status.set_text(error)
+        return False
+
+    def _render_snapshot(self, snapshot):
+        self.tag.set_text(snapshot.profile)
+        self.profile_value.set_text(snapshot.profile)
+        for mode, button in self.mode_buttons.items():
+            context = button.get_style_context()
+            (context.add_class if snapshot.mode.value == mode.lower()
+             else context.remove_class)("on")
+        count = snapshot.agent_sessions
+        self.primary_value.set_text(
+            "%d LIVE SESSION%s" % (count, "" if count == 1 else "S")
+        )
+        labels = [group.label.casefold() for group in snapshot.groups]
+        self.lane_values["brave"].set_text("ACTIVE" if any("brave" in item for item in labels) else "IDLE")
+        self.lane_values["code"].set_text("ACTIVE" if any("code" in item for item in labels) else "IDLE")
+        self.lane_values["media"].set_text(
+            "ACTIVE" if any(any(name in item for name in ("spotify", "vlc", "telegram"))
+                            for item in labels) else "IDLE"
+        )
+        capabilities = {item.name: item for item in snapshot.capabilities}
+        for name, value in self.capability_values.items():
+            if name == "network":
+                value.set_text(snapshot.network_label)
+            else:
+                capability = capabilities.get(name)
+                value.set_text(capability.level.upper() if capability else "UNAVAILABLE")
+        self.meeting_value.set_text("ACTIVE · PROTECTED" if snapshot.meeting_active else "IDLE")
+        self._focus_rendering = True
+        self.focus_switch.set_sensitive(snapshot.mode.value == "focus")
+        self.focus_switch.set_active(snapshot.deep_focus)
+        self._focus_rendering = False
+        selected = snapshot.manual_primary
+        keys = {group.key for group in snapshot.groups}
+        self.priority_note.set_text(
+            ("SAVED · %s UNAVAILABLE" % selected) if selected and selected not in keys
+            else ("MANUAL · %s" % selected if selected else "AUTO · CLAUDE + CODEX")
+        )
+        self.main_status.set_text("LIVE · refreshes every 3s")
+        self._render_apps()
+
+    def _set_mode(self, button, mode):
+        if self.controller is None:
+            return
+        button.set_sensitive(False)
+        def work():
+            try:
+                self.controller.set_mode(getattr(optimizer_core.Mode, mode))
+                snapshot = self.controller.tick()
+                error = ""
+            except Exception as exc:
+                snapshot = None
+                error = "Mode unavailable: %s" % type(exc).__name__
+            GLib.idle_add(self._mode_done, button, snapshot, error)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mode_done(self, button, snapshot, error):
+        if self._destroyed:
+            return False
+        button.set_sensitive(True)
+        if snapshot is not None:
+            self._snapshot = snapshot
+            self._render_snapshot(snapshot)
+        elif error:
+            self.main_status.set_text(error)
+        return False
+
+    def _set_deep_focus(self, switch, _property):
+        if self._focus_rendering or self.controller is None:
+            return
+        switch.set_sensitive(False)
+        enabled = switch.get_active()
+        def work():
+            try:
+                self.controller.set_deep_focus(enabled)
+                snapshot = self.controller.tick()
+                error = ""
+            except Exception as exc:
+                snapshot = None
+                error = "Deep Focus unavailable: %s" % type(exc).__name__
+            GLib.idle_add(self._focus_done, switch, snapshot, error)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _focus_done(self, switch, snapshot, error):
+        if self._destroyed:
+            return False
+        switch.set_sensitive(True)
+        if snapshot is not None:
+            self._snapshot = snapshot
+            self._render_snapshot(snapshot)
+        elif error:
+            self.main_status.set_text(error)
+            switch.set_sensitive(
+                self._snapshot is not None
+                and self._snapshot.mode == optimizer_core.Mode.FOCUS
+            )
+        return False
+
+    def _open_priority(self, button):
+        if self._snapshot is None:
+            return
+        popover = Gtk.Popover.new(button)
+        choices = vbox_plain(4)
+        automatic = self._tile("AUTO · CLAUDE + CODEX")
+        automatic.connect("clicked", self._set_priority, "", popover)
+        choices.pack_start(automatic, False, False, 0)
+        groups = tuple(
+            group for group in self._snapshot.groups
+            if group.managed and group.role != optimizer_core.Role.PROTECTED
+        )
+        selected = self._snapshot.manual_primary
+        if selected and not any(group.key == selected for group in groups):
+            choices.pack_start(L("SAVED · %s UNAVAILABLE" % selected, "faint"),
+                               False, False, 0)
+        for group in groups:
+            choice = self._tile(group.label.upper())
+            choice.connect("clicked", self._set_priority, group.key, popover)
+            choices.pack_start(choice, False, False, 0)
+        popover.add(choices)
+        popover.show_all()
+        popover.popup()
+
+    def _set_priority(self, button, group_key, popover):
+        if self.controller is None:
+            return
+        button.set_sensitive(False)
+        def work():
+            try:
+                saved = self.controller.set_manual_primary(group_key)
+                snapshot = self.controller.tick()
+                error = "" if saved else "Priority preference could not be saved"
+            except Exception as exc:
+                snapshot = None
+                error = "Priority unavailable: %s" % type(exc).__name__
+            GLib.idle_add(self._priority_done, button, popover, snapshot, error)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _priority_done(self, button, popover, snapshot, error):
+        if self._destroyed:
+            return False
+        button.set_sensitive(True)
+        popover.popdown()
+        if snapshot is not None:
+            self._snapshot = snapshot
+            self._render_snapshot(snapshot)
+        if error:
+            self.main_status.set_text(error)
+        return False
+
+    # ---- app controls operate only on current resolved groups -------------
+    def _render_apps(self):
+        if not hasattr(self, "app_box"):
+            return
+        for child in self.app_box.get_children():
+            self.app_box.remove(child)
+        snapshot = self._snapshot
+        if snapshot is None:
+            self.app_status.set_text("RESOLVING APP GROUPS")
+            return
+        current_keys = {group.key for group in snapshot.groups}
+        for key in tuple(self._force_tokens):
+            if key not in current_keys:
+                self._force_tokens.pop(key, None)
+        self.app_status.set_text(self._app_status_text or "CURRENT RESOLVED GROUPS")
+        if not snapshot.groups:
+            self.app_box.pack_start(L("NO MANAGED APPLICATION GROUPS", "faint"),
+                                    False, False, 0)
+        for group in snapshot.groups:
+            self.app_box.pack_start(self._app_row(group), False, False, 0)
+        self.app_box.show_all()
+        schedule_relayout()
+
+    def _app_row(self, group):
+        box = vbox_plain(3)
+        head = Gtk.Box(spacing=8)
+        title = L(group.label.upper(), "k"); title.set_hexpand(True)
+        head.pack_start(title, True, True, 0)
+        role = group.role
+        if role == optimizer_core.Role.PRIMARY:
+            status = "PRIMARY · PROTECTED"
+        elif role == optimizer_core.Role.MEETING:
+            status = "MEETING GUARD · PROTECTED"
+        elif role == optimizer_core.Role.PROTECTED:
+            status = "PROTECTED"
+        elif not group.managed:
+            status = "UNMANAGED"
+        else:
+            status = role.value.upper()
+        head.pack_end(L(status, "faint"), False, False, 0)
+        box.pack_start(head, False, False, 0)
+        if role in (optimizer_core.Role.PRIMARY, optimizer_core.Role.MEETING,
+                    optimizer_core.Role.PROTECTED):
+            return box
+        if not group.managed:
+            if group.reason:
+                box.pack_start(L(group.reason, "faint"), False, False, 0)
+            return box
+        actions = Gtk.Box(spacing=5)
+        controls = optimizer_core.app_action_controls(
+            group, self._app_action_busy, self._force_tokens)
+        for control in controls:
+            button = self._tile(control.label)
+            button.set_sensitive(control.enabled)
+            action = control.action
+            if action == "end":
+                button.connect("clicked", lambda widget, key=group.key:
+                               self._confirm(widget, "END", lambda:
+                                             self._run_app_action(widget, "end", key)))
+            elif action == "force":
+                button.connect("clicked", lambda widget, key=group.key,
+                               value=control.end_token:
+                               self._confirm(widget, "FORCE", lambda:
+                                             self._run_app_action(widget, "force", key, value)))
+            else:
+                button.connect("clicked", lambda widget, act=action, key=group.key:
+                               self._run_app_action(widget, act, key))
+            actions.pack_start(button, True, True, 0)
+        box.pack_start(actions, False, False, 0)
+        return box
+
+    def _run_app_action(self, button, action, group_key, end_token=""):
+        if self.controller is None:
+            return
+        busy_key = (group_key, action)
+        if busy_key in self._app_action_busy:
+            return
+        self._app_action_busy.add(busy_key)
+        button.set_sensitive(False)
+        self._render_apps()
+        def work():
+            try:
+                result = self.controller.action(action, group_key, end_token)
+                error = ""
+            except Exception as exc:
+                result = None
+                error = "%s unavailable: %s" % (action.upper(), type(exc).__name__)
+            GLib.idle_add(self._app_action_done, busy_key, result, error)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _app_action_done(self, busy_key, result, error):
+        self._app_action_busy.discard(busy_key)
+        if self._destroyed:
+            return False
+        if result is not None:
+            self._app_status_text = result.detail or result.action.upper()
+            if result.action == "end":
+                if result.survived > 0 and result.end_token:
+                    self._force_tokens[result.group_key] = result.end_token
+                else:
+                    self._force_tokens.pop(result.group_key, None)
+            elif result.action == "force":
+                self._force_tokens.pop(result.group_key, None)
+        elif error:
+            self._app_status_text = error
+        self._render_apps()
+        self._tick_async()
+        return False
+
+    def _on_destroy(self, *_):
+        if self._destroyed:
+            return
+        self._destroyed = True
+        if self.controller is None:
+            return
+        self._restore_thread = optimizer_core.shutdown_optimizer_controller(
+            self.controller, restore_timeout=1.0)
+
+    # ---- arming: a stray click must never delete a cache or kill an app ----
+    def _confirm(self, btn, label, action):
+        """First click arms the button (SURE? for 3 s); a second click inside that
+        window commits. Anything else disarms it."""
+        if getattr(btn, "_arm_id", None):
+            GLib.source_remove(btn._arm_id); btn._arm_id = None
+            btn.set_label(label); btn.get_style_context().remove_class("on")
+            action(); return
+        btn.set_label("SURE?"); btn.get_style_context().add_class("on")
+        def disarm():
+            btn._arm_id = None
+            btn.set_label(label); btn.get_style_context().remove_class("on")
+            return False
+        btn._arm_id = GLib.timeout_add(3000, disarm)
+
+    # ---- scanning ----------------------------------------------------------
+    def _scan_async(self, *_):
+        if self._destroyed:
+            return False
+        if cleaner_core is None or self.busy: return True
+        self.busy = True
+        def work():
+            try: rows = cleaner_core.scan()
+            except Exception: rows = []
+            GLib.idle_add(self._scan_done, rows)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _scan_done(self, rows):
+        if self._destroyed:
+            return False
+        self.busy = False
+        self.scan_rows = rows
+        self.reclaim = cleaner_core.reclaimable(rows) if rows else 0
+        self._render()
+        return False
+
+    def _render(self):
+        rows = self.scan_rows
+        self.total.set_text(hsize(self.reclaim) if rows else "—")
+        for box in (self.tbox, self.hbox):
+            for ch in box.get_children(): box.remove(ch)
+        auto = sorted([r for r in rows if not r["held"]],
+                      key=lambda r: -r["bytes"])
+        held = sorted([r for r in rows if r["held"]], key=lambda r: -r["bytes"])
+        ok = [r for r in auto if r["state"] == "ok" and r["bytes"] > 0]
+        # Scale the bars against the rows that actually draw one. Including the AUTH
+        # rows in the maximum flattens every cleanable row to a single dot.
+        mx = max([r["bytes"] for r in ok] or [1]) or 1
+        # Rows that cannot be cleaned are pinned in regardless of size. They sort to
+        # the bottom on bytes (they contribute 0 to the total), so ranking alone
+        # would hide the fact that ~2 GB is one install step from being reclaimable.
+        flagged = [r for r in auto if r["state"] != "ok"]
+        shown = ok[:self.SHOWN]
+        for r in shown:
+            self.tbox.pack_start(self._target_row(r, mx), False, False, 0)
+        rest = ok[self.SHOWN:]
+        if rest:
+            other = {"label": "OTHER · %d" % len(rest), "state": "ok",
+                     "bytes": sum(r["bytes"] for r in rest)}
+            self.tbox.pack_start(self._target_row(other, mx), False, False, 0)
+        for r in flagged:
+            self.tbox.pack_start(self._target_row(r, mx), False, False, 0)
+        locked = sum(r["bytes"] for r in flagged if r["state"] == "auth")
+        if locked and not self.busy:
+            # No "--" in this string: the card font ligates it into an em dash, so
+            # the command rendered as "install.sh —with-cleaner-sudo" and looked
+            # mistyped. Name the thing needed instead of the exact flag.
+            self.status.set_text("%s LOCKED · needs the sudoers rule" % hsize(locked))
+        for r in held:
+            self.hbox.pack_start(self._held_row(r), False, False, 0)
+        self.heldlbl.set_visible(bool(held))
+        self.tbox.show_all(); self.hbox.show_all()
+        schedule_relayout()
+
+    def _target_row(self, r, mx):
+        row = Gtk.Box(spacing=10)
+        k = L(r["label"], "k"); k.set_size_request(104, -1)
+        # An uncleanable row spends its meter column on the reason instead of a bar,
+        # so it still carries its size in the value column where the eye expects it.
+        flag = {"auth": "AUTH", "err": "ERR", "blocked": "BLOCKED"}.get(r["state"])
+        meter = L(flag or dots(r["bytes"] / mx * 100 if mx else 0, 10), "meter")
+        val = L(hsize(r["bytes"]), "dim"); val.set_xalign(1); val.set_size_request(58, -1)
+        row.pack_start(k, False, False, 0)
+        row.pack_start(meter, False, False, 0)
+        row.pack_end(val, False, False, 0)
+        return row
+
+    def _held_row(self, r):
+        row = Gtk.Box(spacing=10)
+        k = L(r["label"], "k"); k.set_size_request(104, -1)
+        val = L(hsize(r["bytes"]), "dim"); val.set_xalign(1)
+        btn = Gtk.Button(label="×")
+        btn.get_style_context().add_class("tile")
+        btn.set_relief(Gtk.ReliefStyle.NONE); btn.set_size_request(34, 24)
+        btn.connect("clicked", lambda w, key=r["key"]:
+                    self._confirm(w, "×", lambda: self._clean([key])))
+        row.pack_start(k, False, False, 0)
+        row.pack_start(val, True, True, 0)
+        row.pack_end(btn, False, False, 0)
+        return row
+
+    # ---- cleaning ----------------------------------------------------------
+    def _clean_now(self, *_):
+        if not self.scan_rows: return
+        self._clean(cleaner_core.auto_keys(self.scan_rows))
+
+    def _clean(self, keys):
+        if cleaner_core is None or self.busy or not keys: return
+        self.busy = True
+        self.btn.set_sensitive(False)
+        self.status.set_text("CLEANING")
+        def work():
+            # Snapshot first: a cache we clear may belong to a running app, and the
+            # user should get it back rather than discover it gone an hour later.
+            snap = cleaner_core.snapshot_watched()
+            try: results = cleaner_core.clean(keys)
+            except Exception: results = []
+            time.sleep(1.5)                     # let anything knocked over exit
+            try: back = cleaner_core.revive(snap)
+            except Exception: back = []
+            try: rows = cleaner_core.scan()
+            except Exception: rows = []
+            GLib.idle_add(self._clean_done, results, back, rows)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clean_done(self, results, back, rows):
+        if self._destroyed:
+            return False
+        self.busy = False
+        self.btn.set_sensitive(True)
+        freed = sum(r["freed"] for r in results)
+        msg = "FREED " + hsize(freed)
+        skipped = [r["key"].upper() for r in results if r["state"] != "ok"]
+        if back:    msg += " · RESTARTED " + ", ".join(back)
+        if skipped: msg += " · SKIPPED " + ",".join(skipped)
+        self.status.set_text(msg)
+        self._scan_done(rows)
+        return False
+
+    def on_collapse(self, collapsed):
+        if not collapsed:
+            self._scan_async()
+
 # ---------- RAIL (slim strip; expands the cards that aren't in the pane) ----------
 class Rail(Widget):
     """A thin vertical launcher on the left edge. Each icon shows/hides its card
@@ -2373,7 +3044,7 @@ def main():
         _w.set_size_request(NOTES_W if _n == "notes" else POPOUT_W, -1)
     # --- the pane: the five cards worth seeing at a glance ---
     pane = [Clock(), System(), Status(), Network(), NowPlaying(), Sessions()]
-    chrome = [Rail(rail_targets), AssistantOrb(assistant), Launcher(), Repos()]
+    chrome = [Rail(rail_targets), AssistantOrb(assistant), Launcher(), Repos(), Optimizer()]
     for w in pane + chrome: w.show_all()
     start_pulse()
     GLib.idle_add(relayout_pane)          # stack the column once real sizes are known
