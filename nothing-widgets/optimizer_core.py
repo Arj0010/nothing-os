@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -106,6 +107,14 @@ class ActionResult:
 
 
 @dataclass(frozen=True)
+class AppActionControl:
+    action: str
+    label: str
+    enabled: bool
+    end_token: str = ""
+
+
+@dataclass(frozen=True)
 class OptimizerSettings:
     manual_primary: str = ""
 
@@ -168,6 +177,72 @@ def build_snapshot(mode, groups, capabilities, deep_focus, meeting_active=False,
         deep_focus=bool(deep_focus),
         manual_primary=manual_primary if isinstance(manual_primary, str) else "",
     )
+
+
+def _busy_action_set(busy_actions):
+    result = set()
+    for item in busy_actions or ():
+        try:
+            group_key, action = item
+        except (TypeError, ValueError):
+            continue
+        if isinstance(group_key, str) and isinstance(action, str):
+            result.add((group_key, action))
+    return result
+
+
+def app_action_controls(group, busy_actions=(), force_tokens=None):
+    """Return stable App Control buttons for one resolved app group.
+
+    GTK rows are recreated whenever a fresh controller snapshot arrives.  This
+    display-free contract keeps per-group/action in-flight state separate from
+    short-lived button widgets, so a render cannot accidentally re-enable a
+    still-running action.
+    """
+    if (not group.managed or group.role in (
+            Role.PRIMARY, Role.MEETING, Role.PROTECTED)):
+        return ()
+    busy = _busy_action_set(busy_actions)
+    controls = [
+        AppActionControl(action, label, (group.key, action) not in busy)
+        for action, label in (
+            ("pause", "PAUSE"), ("resume", "RESUME"), ("end", "END"))
+    ]
+    token = ""
+    try:
+        token = force_tokens.get(group.key, "") if force_tokens is not None else ""
+    except AttributeError:
+        token = ""
+    if isinstance(token, str) and token:
+        controls.append(AppActionControl(
+            "force", "FORCE", (group.key, "force") not in busy, token))
+    return tuple(controls)
+
+
+def shutdown_optimizer_controller(controller, restore_timeout=1.0):
+    """Close the guard synchronously, then give restore a bounded non-daemon path."""
+    if controller is None:
+        return None
+    try:
+        controller.close()
+    except Exception:
+        pass
+
+    def restore():
+        try:
+            controller.restore()
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=restore)
+    thread.daemon = False
+    thread.start()
+    try:
+        timeout = max(0.0, float(restore_timeout))
+    except (TypeError, ValueError):
+        timeout = 1.0
+    thread.join(timeout=timeout)
+    return thread
 
 
 DEFAULT_LOGIN_MODE = Mode.AUTO
@@ -2297,6 +2372,7 @@ class OptimizerController:
         self._last_desired = None
         self._last_applied_at = None
         self._recovered = False
+        self._lock = threading.RLock()
 
         shared_journal = journal or RuntimeJournal()
         self.resource = resource or ResourceController(
@@ -2311,7 +2387,8 @@ class OptimizerController:
 
     def groups(self):
         """Return the most recently resolved immutable application groups."""
-        return self._groups
+        with self._lock:
+            return self._groups
 
     def _resolve(self):
         try:
@@ -2353,6 +2430,10 @@ class OptimizerController:
 
     def tick(self):
         """Discover, safely recover once, apply changed policy, and snapshot."""
+        with self._lock:
+            return self._tick_locked()
+
+    def _tick_locked(self):
         groups, capture = self._resolve()
         self._groups = groups
         if not self._recovered:
@@ -2392,68 +2473,84 @@ class OptimizerController:
 
     def set_mode(self, mode):
         """Select a policy mode; leaving Focus safely releases Deep Focus."""
-        self.mode = Mode(mode)
-        if self.mode != Mode.FOCUS and self.deep_focus:
-            self.set_deep_focus(False)
-        self._last_desired = None
-        return self.mode
+        with self._lock:
+            self.mode = Mode(mode)
+            if self.mode != Mode.FOCUS and self.deep_focus:
+                self.set_deep_focus(False)
+            self._last_desired = None
+            return self.mode
 
     def set_manual_primary(self, group_key):
         """Persist a stable primary override without deleting unavailable choices."""
-        group_key = group_key if isinstance(group_key, str) else ""
-        self.settings = OptimizerSettings(manual_primary=group_key)
-        self._last_desired = None
-        if not self.settings_path:
-            return True
-        return save_settings(self.settings_path, self.settings)
+        with self._lock:
+            group_key = group_key if isinstance(group_key, str) else ""
+            self.settings = OptimizerSettings(manual_primary=group_key)
+            self._last_desired = None
+            if not self.settings_path:
+                return True
+            return save_settings(self.settings_path, self.settings)
 
     def set_deep_focus(self, enabled):
         """Pause only eligible background groups, and only while Focus is selected."""
-        enabled = bool(enabled) and self.mode == Mode.FOCUS
-        try:
-            result = self.applications.set_deep_focus(self._groups, enabled)
-        except Exception:
-            result = ()
-        self.deep_focus = enabled
-        self._last_desired = None
-        return tuple(result)
+        with self._lock:
+            enabled = bool(enabled) and self.mode == Mode.FOCUS
+            try:
+                result = self.applications.set_deep_focus(self._groups, enabled)
+            except Exception:
+                result = ()
+            self.deep_focus = enabled
+            self._last_desired = None
+            return tuple(result)
 
     def action(self, action, group_key, end_token=""):
         """Run one safe manual action against a freshly resolved AppGroup."""
-        group = next((item for item in self._groups if item.key == group_key), None)
-        if group is None:
+        with self._lock:
+            groups, _capture = self._resolve()
+            self._groups = groups
+            group = next((item for item in groups if item.key == group_key), None)
+            if group is None:
+                return ActionResult(action, group_key, 0, 0,
+                                    detail="Resolved application group is unavailable")
+            if action in ("pause", "end", "force") and not _action_allowed(group):
+                protected = group.role in (Role.PRIMARY, Role.MEETING, Role.PROTECTED)
+                detail = (
+                    "Protected groups cannot be %sd" % action
+                    if protected else "Only managed application groups can be %sd" % action
+                )
+                return ActionResult(action, group.key, 0, 0, protected, detail)
+            if action == "pause":
+                return self.applications.pause(group, known_groups=groups)
+            if action == "resume":
+                return self.applications.resume(group.key)
+            if action == "end":
+                return self.applications.end(group)
+            if action == "force":
+                return self.applications.force(group, end_token)
             return ActionResult(action, group_key, 0, 0,
-                                detail="Resolved application group is unavailable")
-        if action == "pause":
-            return self.applications.pause(group, known_groups=self._groups)
-        if action == "resume":
-            return self.applications.resume(group.key)
-        if action == "end":
-            return self.applications.end(group)
-        if action == "force":
-            return self.applications.force(group, end_token)
-        return ActionResult(action, group_key, 0, 0, detail="Unknown application action")
+                                detail="Unknown application action")
 
     def restore(self):
         """Release only optimizer-owned resources and pauses before shutdown."""
-        result = []
-        try:
-            self.applications.set_deep_focus(self._groups, False)
-            result.extend(self.applications.restore_interrupted())
-        except Exception:
-            pass
-        try:
-            result.extend(self.resource.restore())
-        except Exception:
-            pass
-        self.deep_focus = False
-        return tuple(result)
+        with self._lock:
+            result = []
+            try:
+                self.applications.set_deep_focus(self._groups, False)
+                result.extend(self.applications.restore_interrupted())
+            except Exception:
+                pass
+            try:
+                result.extend(self.resource.restore())
+            except Exception:
+                pass
+            self.deep_focus = False
+            return tuple(result)
 
     def close(self):
-        """Close the crash guard after restore has been attempted."""
-        lease = getattr(self.applications, "lease", None)
-        try:
-            if lease is not None:
-                lease.close()
-        except Exception:
-            pass
+        """Close the crash guard through the serialized controller path."""
+        with self._lock:
+            lease = getattr(self.applications, "lease", None)
+            try:
+                if lease is not None:
+                    lease.close()
+            except Exception:
+                pass

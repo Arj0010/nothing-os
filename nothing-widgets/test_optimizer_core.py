@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -183,6 +184,53 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(snapshot.deep_focus)
 
 
+class AppControlPresentationTest(unittest.TestCase):
+    def test_busy_action_stays_disabled_when_a_snapshot_recreates_group_rows(self):
+        group = sample_groups()[1]
+
+        controls = {
+            control.action: control
+            for control in oc.app_action_controls(
+                group,
+                busy_actions=((group.key, "end"),),
+            )
+        }
+        self.assertTrue(controls["pause"].enabled)
+        self.assertTrue(controls["resume"].enabled)
+        self.assertFalse(controls["end"].enabled)
+
+        recreated = replace(group, label="Postman rebuilt from a new snapshot")
+        controls = {
+            control.action: control
+            for control in oc.app_action_controls(
+                recreated,
+                busy_actions=((group.key, "end"),),
+            )
+        }
+        self.assertFalse(controls["end"].enabled)
+
+        controls = {
+            control.action: control
+            for control in oc.app_action_controls(recreated, busy_actions=())
+        }
+        self.assertTrue(controls["end"].enabled)
+
+    def test_force_control_uses_current_token_and_its_own_busy_state(self):
+        group = sample_groups()[1]
+
+        controls = {
+            control.action: control
+            for control in oc.app_action_controls(
+                group,
+                busy_actions=((group.key, "force"),),
+                force_tokens={group.key: "fresh-token"},
+            )
+        }
+
+        self.assertEqual(controls["force"].end_token, "fresh-token")
+        self.assertFalse(controls["force"].enabled)
+
+
 class _FakeOptimizerResources:
     def __init__(self):
         self.applied = []
@@ -236,6 +284,222 @@ class OptimizerControllerTest(unittest.TestCase):
         self.assertEqual(third.mode, oc.Mode.PERFORMANCE)
         self.assertEqual(len(resources.applied), 2)
         self.assertEqual(apps.recoveries, 1)
+
+    def test_action_reresolves_before_authorizing_a_stale_group(self):
+        background = sample_groups()[1]
+        primary = replace(background, role=oc.Role.PRIMARY)
+        states = [background, primary, background, primary]
+
+        class RecordingApps(_FakeOptimizerApps):
+            def __init__(self):
+                super().__init__()
+                self.paused = []
+                self.ended = []
+
+            def pause(self, group, known_groups=None):
+                del known_groups
+                self.paused.append(group)
+                return oc.ActionResult("pause", group.key, 1, 0, detail="Paused")
+
+            def end(self, group):
+                self.ended.append(group)
+                return oc.ActionResult("end", group.key, 1, 0, detail="Ended")
+
+        apps = RecordingApps()
+        controller = oc.OptimizerController(
+            runner=FakeRunner(),
+            resource=_FakeOptimizerResources(),
+            applications=apps,
+            discovery=lambda: (),
+            classifier=lambda processes, **kwargs: (states.pop(0),),
+            capture_probe=lambda runner: oc.CaptureState(False, False, True),
+            clock=FakeClock(),
+            cooldown=60,
+        )
+
+        controller.tick()
+        ended = controller.action("end", background.key)
+        controller.tick()
+        paused = controller.action("pause", background.key)
+
+        self.assertTrue(ended.protected)
+        self.assertTrue(paused.protected)
+        self.assertEqual(apps.ended, [])
+        self.assertEqual(apps.paused, [])
+
+    def test_action_promotes_capture_before_authorizing_a_stale_brave_group(self):
+        captures = [
+            oc.CaptureState(False, False, True),
+            oc.CaptureState(True, True, True),
+        ]
+
+        class RecordingApps(_FakeOptimizerApps):
+            def __init__(self):
+                super().__init__()
+                self.ended = []
+
+            def end(self, group):
+                self.ended.append(group)
+                return oc.ActionResult("end", group.key, 1, 0, detail="Ended")
+
+        apps = RecordingApps()
+        controller = oc.OptimizerController(
+            runner=FakeRunner(),
+            resource=_FakeOptimizerResources(),
+            applications=apps,
+            discovery=lambda: (),
+            classifier=lambda processes, **kwargs: brave_groups(),
+            capture_probe=lambda runner: captures.pop(0),
+            clock=FakeClock(),
+            cooldown=60,
+        )
+
+        self.assertEqual(controller.tick().groups[0].role, oc.Role.INTERACTIVE)
+        result = controller.action("end", "brave")
+
+        self.assertTrue(result.protected)
+        self.assertEqual(apps.ended, [])
+
+    def test_actions_wait_for_policy_application_to_finish(self):
+        apply_entered = threading.Event()
+        release_apply = threading.Event()
+        action_entered = threading.Event()
+
+        class BlockingResources(_FakeOptimizerResources):
+            def apply(self, mode, groups, active_primary):
+                apply_entered.set()
+                release_apply.wait(timeout=2)
+                return super().apply(mode, groups, active_primary)
+
+        class RecordingApps(_FakeOptimizerApps):
+            def pause(self, group, known_groups=None):
+                del group, known_groups
+                action_entered.set()
+                return oc.ActionResult("pause", "postman", 1, 0, detail="Paused")
+
+        controller = oc.OptimizerController(
+            runner=FakeRunner(),
+            resource=BlockingResources(),
+            applications=RecordingApps(),
+            discovery=lambda: (),
+            classifier=lambda processes, **kwargs: (sample_groups()[1],),
+            capture_probe=lambda runner: oc.CaptureState(False, False, True),
+            clock=FakeClock(),
+            cooldown=60,
+        )
+
+        tick_thread = threading.Thread(target=controller.tick)
+        tick_thread.start()
+        self.assertTrue(apply_entered.wait(timeout=1))
+
+        action_thread = threading.Thread(
+            target=lambda: controller.action("pause", "postman")
+        )
+        action_thread.start()
+        self.assertFalse(action_entered.wait(timeout=0.1))
+
+        release_apply.set()
+        tick_thread.join(timeout=1)
+        action_thread.join(timeout=1)
+
+        self.assertFalse(tick_thread.is_alive())
+        self.assertFalse(action_thread.is_alive())
+        self.assertTrue(action_entered.is_set())
+
+    def test_controller_mutators_wait_for_policy_application_to_finish(self):
+        apply_entered = threading.Event()
+        release_apply = threading.Event()
+        completed = []
+
+        class BlockingResources(_FakeOptimizerResources):
+            def apply(self, mode, groups, active_primary):
+                apply_entered.set()
+                release_apply.wait(timeout=2)
+                return super().apply(mode, groups, active_primary)
+
+        class RecordingApps(_FakeOptimizerApps):
+            def __init__(self):
+                super().__init__()
+                self.lease = FakeLease()
+
+            def pause(self, group, known_groups=None):
+                del group, known_groups
+                return oc.ActionResult("pause", "postman", 1, 0, detail="Paused")
+
+        controller = oc.OptimizerController(
+            runner=FakeRunner(),
+            resource=BlockingResources(),
+            applications=RecordingApps(),
+            discovery=lambda: (),
+            classifier=lambda processes, **kwargs: (sample_groups()[1],),
+            capture_probe=lambda runner: oc.CaptureState(False, False, True),
+            clock=FakeClock(),
+            cooldown=60,
+        )
+
+        tick_thread = threading.Thread(target=controller.tick)
+        tick_thread.start()
+        self.assertTrue(apply_entered.wait(timeout=1))
+
+        def run(name, call):
+            call()
+            completed.append(name)
+
+        mutators = (
+            ("mode", lambda: controller.set_mode(oc.Mode.BATTERY)),
+            ("manual", lambda: controller.set_manual_primary("postman")),
+            ("deep_focus", lambda: controller.set_deep_focus(True)),
+            ("action", lambda: controller.action("pause", "postman")),
+            ("restore", controller.restore),
+            ("close", controller.close),
+        )
+        threads = [
+            threading.Thread(target=run, args=(name, call))
+            for name, call in mutators
+        ]
+        for thread in threads:
+            thread.start()
+
+        time.sleep(0.1)
+        self.assertEqual(completed, [])
+
+        release_apply.set()
+        tick_thread.join(timeout=1)
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertFalse(tick_thread.is_alive())
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertCountEqual(completed, [name for name, _call in mutators])
+
+    def test_shutdown_closes_guard_before_bounded_non_daemon_restore(self):
+        restore_entered = threading.Event()
+        release_restore = threading.Event()
+
+        class SlowController:
+            def __init__(self):
+                self.events = []
+
+            def close(self):
+                self.events.append("close")
+
+            def restore(self):
+                self.events.append("restore")
+                restore_entered.set()
+                release_restore.wait(timeout=2)
+
+        controller = SlowController()
+
+        thread = oc.shutdown_optimizer_controller(controller, restore_timeout=0.01)
+
+        self.assertEqual(controller.events, ["close", "restore"])
+        self.assertTrue(restore_entered.is_set())
+        self.assertFalse(thread.daemon)
+        self.assertTrue(thread.is_alive())
+
+        release_restore.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
 
 
 def resource_runner(**kwargs):

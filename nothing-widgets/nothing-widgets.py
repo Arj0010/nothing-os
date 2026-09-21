@@ -1626,8 +1626,10 @@ class Optimizer(Widget):
         self._tick_busy = False
         self._snapshot = None
         self._force_tokens = {}
+        self._app_action_busy = set()
         self._app_status_text = ""
         self._focus_rendering = False
+        self._restore_thread = None
         self.controller = None
 
         b = vbox(7, m=22)
@@ -2019,30 +2021,37 @@ class Optimizer(Widget):
                 box.pack_start(L(group.reason, "faint"), False, False, 0)
             return box
         actions = Gtk.Box(spacing=5)
-        for label, action in (("PAUSE", "pause"), ("RESUME", "resume"), ("END", "end")):
-            button = self._tile(label)
+        controls = optimizer_core.app_action_controls(
+            group, self._app_action_busy, self._force_tokens)
+        for control in controls:
+            button = self._tile(control.label)
+            button.set_sensitive(control.enabled)
+            action = control.action
             if action == "end":
                 button.connect("clicked", lambda widget, key=group.key:
                                self._confirm(widget, "END", lambda:
                                              self._run_app_action(widget, "end", key)))
+            elif action == "force":
+                button.connect("clicked", lambda widget, key=group.key,
+                               value=control.end_token:
+                               self._confirm(widget, "FORCE", lambda:
+                                             self._run_app_action(widget, "force", key, value)))
             else:
                 button.connect("clicked", lambda widget, act=action, key=group.key:
                                self._run_app_action(widget, act, key))
             actions.pack_start(button, True, True, 0)
-        token = self._force_tokens.get(group.key, "")
-        if token:
-            force = self._tile("FORCE")
-            force.connect("clicked", lambda widget, key=group.key, value=token:
-                          self._confirm(widget, "FORCE", lambda:
-                                        self._run_app_action(widget, "force", key, value)))
-            actions.pack_start(force, True, True, 0)
         box.pack_start(actions, False, False, 0)
         return box
 
     def _run_app_action(self, button, action, group_key, end_token=""):
         if self.controller is None:
             return
+        busy_key = (group_key, action)
+        if busy_key in self._app_action_busy:
+            return
+        self._app_action_busy.add(busy_key)
         button.set_sensitive(False)
+        self._render_apps()
         def work():
             try:
                 result = self.controller.action(action, group_key, end_token)
@@ -2050,13 +2059,13 @@ class Optimizer(Widget):
             except Exception as exc:
                 result = None
                 error = "%s unavailable: %s" % (action.upper(), type(exc).__name__)
-            GLib.idle_add(self._app_action_done, button, result, error)
+            GLib.idle_add(self._app_action_done, busy_key, result, error)
         threading.Thread(target=work, daemon=True).start()
 
-    def _app_action_done(self, button, result, error):
+    def _app_action_done(self, busy_key, result, error):
+        self._app_action_busy.discard(busy_key)
         if self._destroyed:
             return False
-        button.set_sensitive(True)
         if result is not None:
             self._app_status_text = result.detail or result.action.upper()
             if result.action == "end":
@@ -2078,12 +2087,8 @@ class Optimizer(Widget):
         self._destroyed = True
         if self.controller is None:
             return
-        def work():
-            try:
-                self.controller.restore()
-            finally:
-                self.controller.close()
-        threading.Thread(target=work, daemon=True).start()
+        self._restore_thread = optimizer_core.shutdown_optimizer_controller(
+            self.controller, restore_timeout=1.0)
 
     # ---- arming: a stray click must never delete a cache or kill an app ----
     def _confirm(self, btn, label, action):
