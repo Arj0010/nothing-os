@@ -1,0 +1,8 @@
+// Let the Guardian user run the fixed root helper via pkexec without a password.
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.freedesktop.policykit.exec" &&
+      action.lookup("program") == "/usr/local/sbin/guardian-root-helper" &&
+      subject.user == "__USER__") {
+    return polkit.Result.YES;
+  }
+});
