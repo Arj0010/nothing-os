@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Guardian session environment
+Exec=systemctl --user import-environment DISPLAY XAUTHORITY
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

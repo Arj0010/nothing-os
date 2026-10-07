@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read", "Glob", "Grep", "Edit", "Write",
+      "Bash(.venv/bin/pytest:*)",
+      "Bash(.venv/bin/guardian scan:*)", "Bash(.venv/bin/guardian history:*)", "Bash(.venv/bin/guardian report:*)",
+      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(journalctl:*)", "Bash(free:*)", "Bash(df:*)", "Bash(cat /proc/pressure/memory)", "Bash(ps:*)",
+      "Bash(docker ps:*)", "Bash(systemctl --user status:*)", "Bash(systemctl --user list-timers:*)"
+    ],
+    "deny": [
+      "Bash(sudo:*)", "Bash(pkexec:*)", "Bash(rm:*)", "Bash(kill:*)", "Bash(pkill:*)",
+      "Bash(git push:*)", "Bash(git reset:*)", "Bash(git checkout:*)", "Bash(git stash:*)", "Bash(git revert:*)",
+      "Bash(./install.sh:*)", "Bash(./uninstall.sh:*)", "Bash(docker rm:*)", "Bash(docker stop:*)",
+      "Bash(.venv/bin/guardian act:*)", "Bash(.venv/bin/guardian ask:*)",
+      "Edit(.git/**)", "Edit(beta/verify.sh)", "Edit(beta/daily.sh)", "Edit(beta/PROMPT.md)", "Edit(beta/settings.json)"
+    ]
+  }
+}
