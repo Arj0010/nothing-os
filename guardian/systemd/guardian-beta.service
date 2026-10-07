@@ -1,0 +1,6 @@
+[Unit]
+Description=Guardian beta: daily report + Claude review session
+
+[Service]
+Type=oneshot
+ExecStart=%h/guardian/beta/daily.sh

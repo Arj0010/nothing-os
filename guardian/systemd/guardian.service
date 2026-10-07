@@ -1,0 +1,11 @@
+[Unit]
+Description=Guardian disk & process check
+
+[Service]
+Type=oneshot
+ExecStart=%h/guardian/.venv/bin/guardian run
+Nice=10
+IOSchedulingClass=idle
+# Normal run peaks ~35 MB; headroom covers the rare `claude -p` advisor child.
+MemoryMax=600M
+TimeoutStartSec=300

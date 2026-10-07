@@ -1,0 +1,3 @@
+# Kill when free RAM < 6% AND free swap < 40% (zram mostly full, before disk-swap thrash).
+# No inner quotes / spaces: systemd passes $EARLYOOM_ARGS split on whitespace, quotes literal.
+EARLYOOM_ARGS="-m 6 -s 40 -r 3600 -n --prefer ^(brave|chrome|chromium|electron|code|node|python3?|ollama|clickhouse-serv|java|WebKitWebProces|Isolated.Web.Co)$ --avoid ^(cinnamon|Xorg|gdm.*|lightdm|sshd|systemd.*|dbus-daemon|pipewire|wireplumber|earlyoom|tailscaled|NetworkManager)$"

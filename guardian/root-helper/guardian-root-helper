@@ -1,0 +1,11 @@
+#!/bin/bash
+# Guardian root helper: exactly three fixed maintenance verbs, nothing else.
+set -euo pipefail
+usage() { echo "usage: guardian-root-helper {apt-clean|journal-vacuum|rotated-logs}" >&2; exit 2; }
+[ "$#" -eq 1 ] || usage
+case "$1" in
+  apt-clean)      exec /usr/bin/apt-get clean ;;
+  journal-vacuum) exec /usr/bin/journalctl --vacuum-size=200M ;;
+  rotated-logs)   exec /usr/bin/find /var/log -xdev -type f \( -name '*.gz' -o -name '*.1' \) -mtime +7 -delete ;;
+  *) usage ;;
+esac
