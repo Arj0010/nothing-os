@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guardian"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["psutil>=5.9", "pydantic>=2.6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+guardian = "guardian.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["guardian*"]
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: touches docker / real processes",
+  "stress: load and overhead tests on the real machine",
+]
+addopts = "-m 'not integration and not stress'"
